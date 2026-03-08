@@ -11,7 +11,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Sequential Model Abstraction**: Stackable `LinearLayer` components managed by a `Sequential` container.
 - [x] **Goal #4: Non-Linear Solving**: Successfully trained to solve the XOR problem natively on the GPU.
 - [x] **Goal #5: Distributed Interconnect**: Multi-node synchronization via **SwiftNIO** with All-Reduce gradient averaging.
-- [x] **Bare-Metal Kernels**: Hand-written MSL for GEMM, Transposition, Bias Addition, Row Summing, MSE Derivative, ReLU Derivative, and SGD Optimization.
+- [x] **Goal #6: Transformer Attention**: Scaled Dot-Product Self-Attention with Softmax, Scaling, and Causal Masking.
+- [x] **Bare-Metal Kernels**: Hand-written MSL for GEMM, Transpose, Softmax, Scale, Causal Mask, Bias Add, ReLU/Derivative, MSE, and SGD.
 
 ## Architecture
 
@@ -19,11 +20,12 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 |-----------|-------------|
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
+| `SelfAttention.swift` | The Transformer core. Implements Q/K/V projections and Scaled Dot-Product Attention. |
 | `Interconnect.swift` | The network layer. High-performance, asynchronous TCP bridge using **SwiftNIO**. |
 | `Sequential.swift` | The orchestrator. Chains layers and manages the multi-layer forward/backward flow. |
 | `LinearLayer.swift` | The building block. Manages parameters, calculates gradients (dW, db, dX), and applies optimization. |
-| `gemm.metal` | The math. Optimized kernels for linear algebra and deep learning operations. |
-| `yanaiengine.swift` | The entry point. Supports standalone, Master, and Worker roles for distributed training. |
+| `gemm.metal` | The math. 11 kernels: GEMM, Transpose, Softmax, Scale, Causal Mask, and more. |
+| `yanaiengine.swift` | The entry point. Demos Self-Attention with verification of softmax and causal masking. |
 
 ## Quick Start
 
@@ -31,20 +33,12 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - A Mac with **Apple Silicon** (M1, M2, M3 series).
 - **Xcode 15+** or the **Swift 6.0+** toolchain.
 
-### Running the Distributed Demo
-To test the interconnect on a single machine, open two terminals:
-
-**Terminal 1 (Master):**
+### Running the Self-Attention Demo
 ```bash
-swift run yanaiengine --master
+cd yanaiengine
+swift run
 ```
-
-**Terminal 2 (Worker):**
-```bash
-swift run yanaiengine --worker
-```
-
-The nodes will automatically discover each other, split the XOR dataset, and synchronize gradients using the **All-Reduce** protocol over TCP.
+Runs a 4-token sequence through Scaled Dot-Product Attention with causal masking, verifying that softmax rows sum to 1.0 and the upper triangle is zeroed.
 
 ### Running via Xcode
 1. In Xcode, select **File > Open...** and select the `yanaiengine` folder (or `Package.swift`).

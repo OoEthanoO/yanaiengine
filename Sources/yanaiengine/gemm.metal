@@ -149,3 +149,88 @@ kernel void sum_rows_kernel(
     }
     output[gid] = sum;
 }
+
+// ============================================================
+// Transformer Kernels
+// ============================================================
+
+// Row-wise Softmax with numerical stability.
+// Dispatch: 1 threadgroup per row, threadgroup width = cols (or padded).
+// Each thread handles one column element in its row.
+kernel void softmax_kernel(
+    device float* data [[buffer(0)]],
+    constant uint& rows [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgSize [[threads_per_threadgroup]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    
+    if (row >= rows) return;
+    
+    // Use threadgroup memory for the reduction
+    threadgroup float shared_max;
+    threadgroup float shared_sum;
+    
+    // Step 1: Find max in this row (thread 0 does the serial scan)
+    if (tid.x == 0) {
+        float m = -INFINITY;
+        for (uint c = 0; c < cols; c++) {
+            float val = data[row * cols + c];
+            m = max(m, val);
+        }
+        shared_max = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Step 2: Subtract max and compute exp (each thread handles its column)
+    if (col < cols) {
+        data[row * cols + col] = exp(data[row * cols + col] - shared_max);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    
+    // Step 3: Sum the exponentials (thread 0 does the serial scan)
+    if (tid.x == 0) {
+        float s = 0.0;
+        for (uint c = 0; c < cols; c++) {
+            s += data[row * cols + c];
+        }
+        shared_sum = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Step 4: Divide by sum
+    if (col < cols) {
+        data[row * cols + col] /= shared_sum;
+    }
+}
+
+// Element-wise scale: data[i] = data[i] * scale_factor
+kernel void scale_kernel(
+    device float* data [[buffer(0)]],
+    constant float& scale [[buffer(1)]],
+    constant uint& length [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) return;
+    data[gid] *= scale;
+}
+
+// Causal Mask: sets upper triangle of a square matrix to -INFINITY
+// For position (row, col): if col > row, set to -INFINITY
+kernel void causal_mask_kernel(
+    device float* data [[buffer(0)]],
+    constant uint& dim [[buffer(1)]],   // square matrix dimension (seqLen)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    
+    if (row >= dim || col >= dim) return;
+    
+    if (col > row) {
+        data[row * dim + col] = -INFINITY;
+    }
+}
