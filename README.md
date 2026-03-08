@@ -12,7 +12,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #4: Non-Linear Solving**: Successfully trained to solve the XOR problem natively on the GPU.
 - [x] **Goal #5: Distributed Interconnect**: Multi-node synchronization via **SwiftNIO** with All-Reduce gradient averaging.
 - [x] **Goal #6: Transformer Attention**: Scaled Dot-Product Self-Attention with Softmax, Scaling, and Causal Masking.
-- [x] **Bare-Metal Kernels**: Hand-written MSL for GEMM, Transpose, Softmax, Scale, Causal Mask, Bias Add, ReLU/Derivative, MSE, and SGD.
+- [x] **Goal #7: Full Transformer Block**: Multi-Head Attention, LayerNorm, GELU, Residual Connections — the exact architecture of GPT/Llama.
+- [x] **Bare-Metal Kernels**: 14 hand-written MSL kernels: GEMM, Transpose, Softmax, Scale, Causal Mask, GELU, LayerNorm, Element-wise Add, and more.
 
 ## Architecture
 
@@ -20,12 +21,14 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 |-----------|-------------|
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
-| `SelfAttention.swift` | The Transformer core. Implements Q/K/V projections and Scaled Dot-Product Attention. |
-| `Interconnect.swift` | The network layer. High-performance, asynchronous TCP bridge using **SwiftNIO**. |
-| `Sequential.swift` | The orchestrator. Chains layers and manages the multi-layer forward/backward flow. |
-| `LinearLayer.swift` | The building block. Manages parameters, calculates gradients (dW, db, dX), and applies optimization. |
-| `gemm.metal` | The math. 11 kernels: GEMM, Transpose, Softmax, Scale, Causal Mask, and more. |
-| `yanaiengine.swift` | The entry point. Demos Self-Attention with verification of softmax and causal masking. |
+| `TransformerBlock.swift` | The LLM core. Pre-Norm architecture with MHA, FFN(GELU), LayerNorm, and Residual Connections. |
+| `MultiHeadAttention.swift` | Parallelized attention. Splits Q/K/V into h heads with batched computation. |
+| `SelfAttention.swift` | Single-head attention. Q/K/V projections and Scaled Dot-Product Attention. |
+| `Interconnect.swift` | The network layer. Asynchronous TCP bridge using **SwiftNIO**. |
+| `Sequential.swift` | The orchestrator. Chains layers for multi-layer forward/backward flow. |
+| `LinearLayer.swift` | The building block. Manages parameters, gradients, and SGD optimization. |
+| `gemm.metal` | The math. 14 kernels: GEMM, Transpose, Softmax, Scale, GELU, LayerNorm, and more. |
+| `yanaiengine.swift` | The entry point. Demos a full TransformerBlock with MHA verification. |
 
 ## Quick Start
 
@@ -33,12 +36,12 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - A Mac with **Apple Silicon** (M1, M2, M3 series).
 - **Xcode 15+** or the **Swift 6.0+** toolchain.
 
-### Running the Self-Attention Demo
+### Running the Transformer Block Demo
 ```bash
 cd yanaiengine
 swift run
 ```
-Runs a 4-token sequence through Scaled Dot-Product Attention with causal masking, verifying that softmax rows sum to 1.0 and the upper triangle is zeroed.
+Runs a 4-token sequence through a full **Transformer Block** (LayerNorm → Multi-Head Attention → Residual → LayerNorm → FFN(GELU) → Residual), verifying shape preservation, transformation, and numerical stability.
 
 ### Running via Xcode
 1. In Xcode, select **File > Open...** and select the `yanaiengine` folder (or `Package.swift`).

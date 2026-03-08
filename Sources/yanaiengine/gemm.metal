@@ -155,55 +155,34 @@ kernel void sum_rows_kernel(
 // ============================================================
 
 // Row-wise Softmax with numerical stability.
-// Dispatch: 1 threadgroup per row, threadgroup width = cols (or padded).
-// Each thread handles one column element in its row.
+// One thread per row — avoids threadgroup barrier issues with partial threadgroups.
+// For each row: find max, subtract, exp, sum, divide.
 kernel void softmax_kernel(
     device float* data [[buffer(0)]],
     constant uint& rows [[buffer(1)]],
     constant uint& cols [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]],
-    uint2 tid [[thread_position_in_threadgroup]],
-    uint2 tgSize [[threads_per_threadgroup]]
+    uint gid [[thread_position_in_grid]]
 ) {
-    uint row = gid.y;
-    uint col = gid.x;
-    
+    uint row = gid;
     if (row >= rows) return;
     
-    // Use threadgroup memory for the reduction
-    threadgroup float shared_max;
-    threadgroup float shared_sum;
-    
-    // Step 1: Find max in this row (thread 0 does the serial scan)
-    if (tid.x == 0) {
-        float m = -INFINITY;
-        for (uint c = 0; c < cols; c++) {
-            float val = data[row * cols + c];
-            m = max(m, val);
-        }
-        shared_max = m;
+    // Step 1: Find max in this row
+    float row_max = -INFINITY;
+    for (uint c = 0; c < cols; c++) {
+        row_max = max(row_max, data[row * cols + c]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Step 2: Subtract max and compute exp (each thread handles its column)
-    if (col < cols) {
-        data[row * cols + col] = exp(data[row * cols + col] - shared_max);
+    // Step 2: Subtract max and compute exp, accumulate sum
+    float row_sum = 0.0;
+    for (uint c = 0; c < cols; c++) {
+        float val = exp(data[row * cols + c] - row_max);
+        data[row * cols + c] = val;
+        row_sum += val;
     }
-    threadgroup_barrier(mem_flags::mem_device);
     
-    // Step 3: Sum the exponentials (thread 0 does the serial scan)
-    if (tid.x == 0) {
-        float s = 0.0;
-        for (uint c = 0; c < cols; c++) {
-            s += data[row * cols + c];
-        }
-        shared_sum = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Step 4: Divide by sum
-    if (col < cols) {
-        data[row * cols + col] /= shared_sum;
+    // Step 3: Normalize
+    for (uint c = 0; c < cols; c++) {
+        data[row * cols + c] /= row_sum;
     }
 }
 
@@ -233,4 +212,68 @@ kernel void causal_mask_kernel(
     if (col > row) {
         data[row * dim + col] = -INFINITY;
     }
+}
+
+// GELU Activation: the activation function used by GPT and Llama.
+// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+kernel void gelu_kernel(
+    device float* data [[buffer(0)]],
+    constant uint& length [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) return;
+    
+    float x = data[gid];
+    float cdf = 0.5 * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
+    data[gid] = x * cdf;
+}
+
+// Layer Normalization: normalizes each row (token) across the embedding dimension.
+// y = gamma * (x - mean) / sqrt(variance + eps) + beta
+// One thread per row — avoids threadgroup barrier issues.
+kernel void layernorm_kernel(
+    device float* data [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device const float* beta [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint row = gid;
+    if (row >= rows) return;
+    
+    // Compute mean
+    float sum = 0.0;
+    for (uint c = 0; c < cols; c++) {
+        sum += data[row * cols + c];
+    }
+    float mean = sum / float(cols);
+    
+    // Compute variance
+    float var_sum = 0.0;
+    for (uint c = 0; c < cols; c++) {
+        float diff = data[row * cols + c] - mean;
+        var_sum += diff * diff;
+    }
+    float inv_std = 1.0 / sqrt(var_sum / float(cols) + eps);
+    
+    // Normalize and apply affine transform
+    for (uint c = 0; c < cols; c++) {
+        float normalized = (data[row * cols + c] - mean) * inv_std;
+        data[row * cols + c] = gamma[c] * normalized + beta[c];
+    }
+}
+
+// Element-wise addition: output[i] = a[i] + b[i]
+// Used for residual connections.
+kernel void elementwise_add_kernel(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& length [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) return;
+    output[gid] = a[gid] + b[gid];
 }

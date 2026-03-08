@@ -125,10 +125,9 @@ public class SelfAttention {
         var sCols = UInt32(seqLen)
         encoder.setBytes(&sRows, length: MemoryLayout<UInt32>.size, index: 1)
         encoder.setBytes(&sCols, length: MemoryLayout<UInt32>.size, index: 2)
-        // Dispatch: one threadgroup per row, width = seqLen threads
         encoder.dispatchThreads(
-            MTLSize(width: seqLen, height: seqLen, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: seqLen, height: 1, depth: 1)
+            MTLSize(width: seqLen, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(softmaxPSO.maxTotalThreadsPerThreadgroup, seqLen), height: 1, depth: 1)
         )
         
         // 2f. Output = scores * V: [seqLen x seqLen] * [seqLen x dModel] = [seqLen x dModel]

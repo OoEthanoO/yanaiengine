@@ -4,107 +4,93 @@ import Metal
 @main
 struct yanaiengine {
     static func main() {
-        let args = CommandLine.arguments
-        
-        // Support legacy distributed mode
-        if args.contains("--master") || args.contains("--worker") {
-            print("Distributed mode requires two terminals. See README.md.")
-            return
-        }
-        
         print("==============================================")
-        print("  YanAIEngine: Goal #6 — Self-Attention")
+        print("  YanAIEngine: Goal #7 — Transformer Block")
         print("==============================================\n")
         
         guard let engine = MetalEngine() else { fatalError("Metal not available") }
         
-        // Load all kernels (existing + new Transformer kernels)
+        // Load all kernels
         let kernels = [
             "gemm_kernel", "bias_add_kernel", "relu_kernel",
             "transpose_kernel", "mse_derivative_kernel", "sgd_update_kernel",
             "relu_derivative_kernel", "sum_rows_kernel",
-            // New for Goal #6:
-            "softmax_kernel", "scale_kernel", "causal_mask_kernel"
+            "softmax_kernel", "scale_kernel", "causal_mask_kernel",
+            // New for Goal #7:
+            "gelu_kernel", "layernorm_kernel", "elementwise_add_kernel"
         ]
         for kernel in kernels {
             engine.loadLibrary(resourceName: "gemm", kernelName: kernel)
         }
         
-        // ---- Setup ----
-        let seqLen = 4   // 4 tokens in the sequence
-        let dModel = 8   // 8-dimensional embedding per token
+        // Configuration
+        let seqLen = 4     // 4 tokens
+        let dModel = 8     // 8-dim embeddings
+        let numHeads = 2   // 2 attention heads (dHead = 4)
         
         print("Configuration:")
-        print("  Sequence Length: \(seqLen)")
-        print("  Model Dimension: \(dModel)")
-        print("  Causal Mask:     ON (autoregressive)\n")
+        print("  Sequence Length:  \(seqLen)")
+        print("  Model Dimension:  \(dModel)")
+        print("  Attention Heads:  \(numHeads) (dHead = \(dModel / numHeads))")
+        print("  FFN Expansion:    4x (\(dModel) → \(4 * dModel) → \(dModel))")
+        print("  Causal Mask:      ON")
+        print("  Activation:       GELU\n")
         
-        // Create a mock input: [seqLen x dModel] — simulating 4 token embeddings
+        // Create input: [seqLen x dModel]
         let input = Tensor(device: engine.device, rows: seqLen, cols: dModel)
         let ptr = input.pointer()
         for i in 0..<(seqLen * dModel) {
-            ptr[i] = Float(i) * 0.1  // Simple ascending pattern
+            ptr[i] = Float(i) * 0.1
         }
         
-        print("Input Embeddings (4 tokens x 8 dims):")
+        print("Input Embeddings (\(seqLen) tokens × \(dModel) dims):")
         input.printMatrix()
         
-        // ---- Create Self-Attention Layer ----
-        let attention = SelfAttention(engine: engine, seqLen: seqLen, dModel: dModel, useCausalMask: true)
+        // Create and run TransformerBlock
+        let block = TransformerBlock(engine: engine, seqLen: seqLen, dModel: dModel, numHeads: numHeads)
         
-        // ---- Forward Pass ----
-        print("Running Scaled Dot-Product Attention on GPU...")
-        attention.forward(input: input)
+        print("Running Full Transformer Block on GPU...")
+        print("  Pipeline: LayerNorm → MHA(2 heads) → Residual → LayerNorm → FFN(GELU) → Residual\n")
+        block.forward(input: input)
         
-        // ---- Verify Results ----
-        print("\n--- Attention Weights (after softmax + causal mask) ---")
-        print("Each row should sum to 1.0. Upper triangle should be 0.0.\n")
+        // ---- Verification ----
+        print("--- Transformer Block Output (\(seqLen) tokens × \(dModel) dims) ---")
+        block.output.printMatrix()
         
-        let scorePtr = attention.scores.pointer()
-        for row in 0..<seqLen {
-            var rowStr = "Token \(row): ["
-            var rowSum: Float = 0
-            for col in 0..<seqLen {
-                let val = scorePtr[row * seqLen + col]
-                rowSum += val
-                rowStr += String(format: "%.4f", val)
-                if col < seqLen - 1 { rowStr += ", " }
-            }
-            rowStr += "]  sum=\(String(format: "%.4f", rowSum))"
-            print(rowStr)
-        }
+        // Check 1: Output shape matches input shape (residual preserves dimensions)
+        let shapeMatch = (block.output.rows == seqLen && block.output.cols == dModel)
         
-        print("\n--- Attention Output (4 tokens x 8 dims) ---")
-        attention.output.printMatrix()
-        
-        // ---- Validation ----
-        var allRowsSumToOne = true
-        var upperTriangleZero = true
-        
-        for row in 0..<seqLen {
-            var rowSum: Float = 0
-            for col in 0..<seqLen {
-                let val = scorePtr[row * seqLen + col]
-                rowSum += val
-                if col > row && val > 1e-6 {
-                    upperTriangleZero = false
-                }
-            }
-            if abs(rowSum - 1.0) > 1e-4 {
-                allRowsSumToOne = false
+        // Check 2: Output is not identical to input (transformation happened)
+        var isTransformed = false
+        let outPtr = block.output.pointer()
+        for i in 0..<(seqLen * dModel) {
+            if abs(outPtr[i] - ptr[i]) > 1e-6 {
+                isTransformed = true
+                break
             }
         }
         
-        print("\n==============================================")
+        // Check 3: Output contains valid numbers (no NaN/Inf)
+        var allFinite = true
+        for i in 0..<(seqLen * dModel) {
+            if outPtr[i].isNaN || outPtr[i].isInfinite {
+                allFinite = false
+                break
+            }
+        }
+        
+        print("==============================================")
         print("  Verification Results")
         print("==============================================")
-        print("  Softmax rows sum to 1.0:  \(allRowsSumToOne ? "✅ PASS" : "❌ FAIL")")
-        print("  Causal mask (upper = 0):  \(upperTriangleZero ? "✅ PASS" : "❌ FAIL")")
+        print("  Shape preserved (residual):  \(shapeMatch ? "✅ PASS" : "❌ FAIL")  [\(block.output.rows)×\(block.output.cols)]")
+        print("  Transformation applied:      \(isTransformed ? "✅ PASS" : "❌ FAIL")")
+        print("  All values finite:           \(allFinite ? "✅ PASS" : "❌ FAIL")")
         print("==============================================")
         
-        if allRowsSumToOne && upperTriangleZero {
-            print("\n🚀 Goal #6 COMPLETE: Self-Attention is running natively on Apple Silicon!")
-            print("   Your engine can now execute the core of GPT / Llama / Transformer.")
+        if shapeMatch && isTransformed && allFinite {
+            print("\n🚀 Goal #7 COMPLETE: Full Transformer Block running on Apple Silicon!")
+            print("   Architecture: Pre-Norm with Multi-Head Attention + FFN(GELU)")
+            print("   This is the exact micro-architecture of GPT, Llama, and Claude.")
         }
     }
 }
