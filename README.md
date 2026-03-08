@@ -17,7 +17,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #9: KV Cache Inference**: Prefill/Decode loop with KV-cached attention — zero redundant recomputation.
 - [x] **Goal #10: INT8 Quantization**: 4x weight compression with on-the-fly GPU dequantization (0.37% error).
 - [x] **Goal #11: Safetensors Loader**: Zero-copy `.safetensors` parser with POSIX `mmap` — ready for HuggingFace models.
-- [x] **Bare-Metal Kernels**: 17 hand-written MSL kernels: GEMM, Q8-GEMM, RoPE, Softmax, GELU, LayerNorm, and more.
+- [x] **Goal #12: Llama 3 Architecture**: RMSNorm, SwiGLU FFN, Grouped Query Attention (GQA), and BPE Tokenizer.
+- [x] **Bare-Metal Kernels**: 19 hand-written MSL kernels: GEMM, Q8-GEMM, RoPE, RMSNorm, SiLU, Softmax, GELU, and more.
 
 ## Architecture
 
@@ -26,6 +27,7 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
 | `TransformerBlock.swift` | The LLM core. Pre-Norm with MHA, FFN(GELU), LayerNorm, Residual Connections. Supports KV-cached decode. |
+| `LlamaBlock.swift` | Llama 3 block. Pre-RMSNorm + GQA + SwiGLU FFN — the exact Meta architecture. |
 | `MultiHeadAttention.swift` | Parallelized attention with **RoPE** positional encoding and KV-cached single-token decode. |
 | `KVCache.swift` | Inference optimizer. Per-head Key/Value buffers with position tracking for Prefill/Decode. |
 | `EmbeddingLayer.swift` | Token ID → dense vector lookup via GPU kernel. |
@@ -36,7 +38,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `LinearLayer.swift` | The building block. Manages parameters, gradients, and SGD optimization. |
 | `QuantizedLinearLayer.swift` | INT8 inference. 4x weight compression with on-the-fly GPU dequantization. |
 | `QuantizedTensor.swift` | Quantized storage. INT8 weights + FP32 per-row scale factors. |
-| `gemm.metal` | The math. 17 kernels: GEMM, Q8-GEMM, RoPE, Softmax, GELU, LayerNorm, and more. |
+| `gemm.metal` | The math. 19 kernels: GEMM, Q8-GEMM, RoPE, RMSNorm, SiLU, Softmax, GELU, and more. |
+| `Tokenizer.swift` | BPE tokenizer. Parses `tokenizer.json` with byte-pair encoding merge rules. |
 | `SafetensorsReader.swift` | HuggingFace bridge. Parses `.safetensors` files via POSIX `mmap` (zero-copy). |
 | `ModelLoader.swift` | Weight injector. FP32/FP16 loading with auto-transpose into Metal buffers. |
 | `yanaiengine.swift` | The entry point. Autoregressive text generation with full LLM pipeline. |

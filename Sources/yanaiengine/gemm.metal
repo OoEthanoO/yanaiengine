@@ -358,3 +358,44 @@ kernel void q8_gemm_kernel(
     }
     C[row * N + col] = sum;
 }
+
+// RMSNorm: x * rsqrt(mean(x²) + eps) * gamma
+// Llama 3 replacement for LayerNorm (no mean centering).
+// One thread per row. Data is modified in-place.
+kernel void rmsnorm_kernel(
+    device float* data [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= rows) return;
+    
+    uint offset = gid * cols;
+    
+    // Compute mean of squares
+    float sumSq = 0.0;
+    for (uint c = 0; c < cols; c++) {
+        float val = data[offset + c];
+        sumSq += val * val;
+    }
+    float rms = rsqrt(sumSq / float(cols) + eps);
+    
+    // Normalize and scale by gamma
+    for (uint c = 0; c < cols; c++) {
+        data[offset + c] = data[offset + c] * rms * gamma[c];
+    }
+}
+
+// SiLU (Sigmoid Linear Unit): x * sigmoid(x)
+// Used inside SwiGLU activation for Llama 3 FFN.
+kernel void silu_kernel(
+    device float* data [[buffer(0)]],
+    constant uint& length [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) return;
+    float x = data[gid];
+    data[gid] = x / (1.0 + exp(-x));
+}
