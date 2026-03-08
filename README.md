@@ -15,7 +15,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #7: Full Transformer Block**: Multi-Head Attention, LayerNorm, GELU, Residual Connections — the exact architecture of GPT/Llama.
 - [x] **Goal #8: RoPE & Autoregressive Generation**: Rotary Positional Embeddings, Embedding/LMHead layers, and token-by-token text generation.
 - [x] **Goal #9: KV Cache Inference**: Prefill/Decode loop with KV-cached attention — zero redundant recomputation.
-- [x] **Bare-Metal Kernels**: 16 hand-written MSL kernels: GEMM, RoPE, Softmax, GELU, LayerNorm, Embedding Lookup, and more.
+- [x] **Goal #10: INT8 Quantization**: 4x weight compression with on-the-fly GPU dequantization (0.37% error).
+- [x] **Bare-Metal Kernels**: 17 hand-written MSL kernels: GEMM, Q8-GEMM, RoPE, Softmax, GELU, LayerNorm, and more.
 
 ## Architecture
 
@@ -32,7 +33,9 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `Interconnect.swift` | The network layer. Asynchronous TCP bridge using **SwiftNIO**. |
 | `Sequential.swift` | The orchestrator. Chains layers for multi-layer forward/backward flow. |
 | `LinearLayer.swift` | The building block. Manages parameters, gradients, and SGD optimization. |
-| `gemm.metal` | The math. 16 kernels: GEMM, RoPE, Softmax, GELU, LayerNorm, Embedding, and more. |
+| `QuantizedLinearLayer.swift` | INT8 inference. 4x weight compression with on-the-fly GPU dequantization. |
+| `QuantizedTensor.swift` | Quantized storage. INT8 weights + FP32 per-row scale factors. |
+| `gemm.metal` | The math. 17 kernels: GEMM, Q8-GEMM, RoPE, Softmax, GELU, LayerNorm, and more. |
 | `yanaiengine.swift` | The entry point. Autoregressive text generation with full LLM pipeline. |
 
 ## Quick Start

@@ -5,8 +5,8 @@ import Metal
 struct yanaiengine {
     static func main() {
         print("==============================================")
-        print("  YanAIEngine: Goal #9 — KV Cache Inference")
-        print("  Prefill + Decode (like vLLM / TensorRT-LLM)")
+        print("  YanAIEngine: Goal #10 — INT8 Quantization")
+        print("  4x Weight Compression with On-the-Fly Dequant")
         print("==============================================\n")
         
         guard let engine = MetalEngine() else { fatalError("Metal not available") }
@@ -18,180 +18,115 @@ struct yanaiengine {
             "relu_derivative_kernel", "sum_rows_kernel",
             "softmax_kernel", "scale_kernel", "causal_mask_kernel",
             "gelu_kernel", "layernorm_kernel", "elementwise_add_kernel",
-            "rope_kernel", "embedding_lookup_kernel"
+            "rope_kernel", "embedding_lookup_kernel",
+            // New for Goal #10:
+            "q8_gemm_kernel"
         ]
         for kernel in kernels {
             engine.loadLibrary(resourceName: "gemm", kernelName: kernel)
         }
         
-        // ---- Vocabulary ----
-        let vocab: [String] = [
-            "the",      // 0
-            "AI",       // 1
-            "engine",   // 2
-            "runs",     // 3
-            "on",       // 4
-            "silicon",  // 5
-            "metal",    // 6
-            "gpu",      // 7
-            "fast",     // 8
-            "now"       // 9
-        ]
-        let vocabSize = vocab.count
-        
         // ---- Configuration ----
-        let maxSeqLen = 8
-        let dModel = 8
-        let numHeads = 2
-        let dHead = dModel / numHeads
+        let batchSize = 4
+        let inputDim = 64
+        let outputDim = 32
         
-        print("Configuration:")
-        print("  Vocab:       \(vocab)")
-        print("  Max Seq:     \(maxSeqLen)")
-        print("  dModel:      \(dModel), Heads: \(numHeads) (dHead = \(dHead))")
-        print("  KV Cache:    \(numHeads) heads × \(maxSeqLen) positions × \(dHead) dims")
-        print("  Pipeline:    Embedding → TransformerBlock(RoPE+KVCache) → LMHead\n")
+        print("Test Configuration:")
+        print("  Batch Size:   \(batchSize)")
+        print("  Input Dim:    \(inputDim)")
+        print("  Output Dim:   \(outputDim)")
+        print("  Weights:      \(inputDim)×\(outputDim) = \(inputDim * outputDim) parameters\n")
         
-        // ---- Build the LLM Pipeline ----
-        let embedding = EmbeddingLayer(engine: engine, vocabSize: vocabSize, dModel: dModel, maxSeqLen: maxSeqLen)
-        let transformer = TransformerBlock(engine: engine, seqLen: maxSeqLen, dModel: dModel, numHeads: numHeads)
-        let lmHead = LMHead(engine: engine, dModel: dModel, vocabSize: vocabSize, maxSeqLen: maxSeqLen)
-        let cache = KVCache(device: engine.device, numHeads: numHeads, dHead: dHead, maxSeqLen: maxSeqLen)
+        // ---- Create FP32 Linear Layer ----
+        let fp32Layer = LinearLayer(engine: engine, inputDim: inputDim, outputDim: outputDim, batchSize: batchSize, useReLU: false)
+        let fp32WeightBytes = inputDim * outputDim * MemoryLayout<Float>.stride
         
-        // Decode-phase LMHead (batchSize=1)
-        let decodeLmHead = LMHead(engine: engine, dModel: dModel, vocabSize: vocabSize, maxSeqLen: 1)
-        // Copy LMHead weights for consistency
-        memcpy(decodeLmHead.logits.pointer(), lmHead.logits.pointer(), 0) // logits is output, not weights
+        // ---- Create INT8 Quantized Layer (from the FP32 layer) ----
+        let int8Layer = QuantizedLinearLayer(engine: engine, from: fp32Layer)
         
-        // ---- Prompt ----
-        let prompt: [UInt32] = [0, 1, 2]  // "the AI engine"
-        let promptStr = prompt.map { vocab[Int($0)] }.joined(separator: " ")
-        let tokensToGenerate = maxSeqLen - prompt.count
+        print("=== MEMORY COMPARISON ===")
+        print("  FP32 weights: \(fp32WeightBytes) bytes (\(fp32WeightBytes / 1024) KB)")
+        print("  INT8 weights: \(int8Layer.int8WeightBytes) bytes (\(int8Layer.int8WeightBytes / 1024) KB)")
+        let ratio = Float(fp32WeightBytes) / Float(int8Layer.int8WeightBytes)
+        print("  Compression:  \(String(format: "%.1f", ratio))x\n")
         
-        print("=== PHASE 1: PREFILL ===")
-        print("  Prompt: \"\(promptStr)\" (\(prompt.count) tokens)")
-        print("  Processing entire prompt in parallel...\n")
-        
-        let prefillStart = DispatchTime.now()
-        
-        // Embed entire prompt
-        embedding.forward(tokenIds: prompt)
-        
-        // Pad to maxSeqLen for the transformer
-        let prefillInput = Tensor(device: engine.device, rows: maxSeqLen, cols: dModel)
-        let srcPtr = embedding.output.pointer()
-        let dstPtr = prefillInput.pointer()
-        for i in 0..<(prompt.count * dModel) {
-            dstPtr[i] = srcPtr[i]
+        // ---- Create Test Input ----
+        let input = Tensor(device: engine.device, rows: batchSize, cols: inputDim)
+        let ptr = input.pointer()
+        for i in 0..<(batchSize * inputDim) {
+            ptr[i] = Float.random(in: -1.0...1.0)
         }
         
-        // Full parallel forward pass (populates output for all positions)
-        transformer.forward(input: prefillInput)
+        // ---- Run FP32 Forward Pass ----
+        print("Running FP32 forward pass...")
+        fp32Layer.forward(input: input)
         
-        // Populate KV cache from the prefill pass
-        // The KV projections happened inside MHA. We need to store the K/V
-        // from the prefill into the cache so decode can use them.
-        // We'll populate by running each prompt token through the cache-append logic.
-        let mha = transformer.mha
-        let kProjPtr = mha.keyProj.output.pointer()
-        let vProjPtr = mha.valueProj.output.pointer()
-        for t in 0..<prompt.count {
-            for h in 0..<numHeads {
-                let headOffset = h * dHead
-                let ckPtr = cache.cachedKeys[h].pointer()
-                let cvPtr = cache.cachedValues[h].pointer()
-                let cacheOffset = t * dHead
-                for d in 0..<dHead {
-                    // Apply RoPE to K before caching (matching what MHA does)
-                    let kVal = kProjPtr[t * dModel + headOffset + d]
-                    ckPtr[cacheOffset + d] = kVal
-                    cvPtr[cacheOffset + d] = vProjPtr[t * dModel + headOffset + d]
-                }
-            }
-        }
-        cache.currentPosition = prompt.count  // exposed via a helper below
+        // ---- Run INT8 Forward Pass ----
+        print("Running INT8 quantized forward pass...\n")
+        int8Layer.forward(input: input)
         
-        // Get first prediction from prefill
-        lmHead.forward(input: transformer.output)
-        let firstToken = lmHead.argmaxLastToken(seqLen: prompt.count)
+        // ---- Compare Outputs ----
+        let fp32Out = fp32Layer.output.pointer()
+        let int8Out = int8Layer.output.pointer()
+        let totalElements = batchSize * outputDim
         
-        let prefillEnd = DispatchTime.now()
-        let prefillMs = Double(prefillEnd.uptimeNanoseconds - prefillStart.uptimeNanoseconds) / 1_000_000
+        var maxError: Float = 0
+        var totalError: Float = 0
         
-        var sequence = prompt + [firstToken]
-        print("  Prefill complete in \(String(format: "%.2f", prefillMs))ms")
-        print("  First prediction: \"\(vocab[Int(firstToken)])\"")
-        print("  Sequence so far:  \"\(sequence.map { vocab[Int($0)] }.joined(separator: " "))\"\n")
-        
-        // ---- DECODE PHASE ----
-        print("=== PHASE 2: DECODE (KV-Cached) ===")
-        print("  Processing ONE token at a time (no recomputation)...\n")
-        
-        let decodeStart = DispatchTime.now()
-        
-        for step in 0..<(tokensToGenerate - 1) {
-            let lastToken = sequence.last!
-            
-            // 1. Embed single token
-            embedding.forward(tokenIds: [lastToken])
-            let singleInput = Tensor(device: engine.device, rows: 1, cols: dModel)
-            memcpy(singleInput.pointer(), embedding.output.pointer(), dModel * MemoryLayout<Float>.stride)
-            
-            // 2. TransformerBlock with KV cache (single token!)
-            let blockOut = transformer.forwardCached(input: singleInput, cache: cache)
-            
-            // 3. LMHead on single token output
-            decodeLmHead.forward(input: blockOut)
-            let nextToken = decodeLmHead.argmaxLastToken(seqLen: 1)
-            
-            sequence.append(nextToken)
-            let seqStr = sequence.map { vocab[Int($0)] }.joined(separator: " ")
-            print("  Decode step \(step + 1): cache_pos=\(cache.currentPosition) → \"\(vocab[Int(nextToken)])\" → [\(seqStr)]")
+        for i in 0..<totalElements {
+            let err = abs(fp32Out[i] - int8Out[i])
+            totalError += err
+            if err > maxError { maxError = err }
         }
         
-        let decodeEnd = DispatchTime.now()
-        let decodeMs = Double(decodeEnd.uptimeNanoseconds - decodeStart.uptimeNanoseconds) / 1_000_000
-        let decodeSteps = tokensToGenerate - 1
+        let meanError = totalError / Float(totalElements)
         
-        // ---- Final Output ----
-        let finalText = sequence.map { vocab[Int($0)] }.joined(separator: " ")
-        
-        print("\n==============================================")
-        print("  Generated Text")
-        print("==============================================")
-        print("  \"\(finalText)\"")
-        print("==============================================\n")
-        
-        // ---- Performance ----
-        print("  Performance")
-        print("==============================================")
-        print("  Prefill:  \(String(format: "%.2f", prefillMs))ms (\(prompt.count) tokens, parallel)")
-        print("  Decode:   \(String(format: "%.2f", decodeMs))ms (\(decodeSteps) tokens, sequential)")
-        if decodeSteps > 0 {
-            print("  Per-token: \(String(format: "%.2f", decodeMs / Double(decodeSteps)))ms/token")
+        // Compute relative error (compared to FP32 output magnitude)
+        var fp32Magnitude: Float = 0
+        for i in 0..<totalElements {
+            fp32Magnitude += abs(fp32Out[i])
         }
-        print("  KV Cache:  \(cache.currentPosition)/\(maxSeqLen) positions filled")
-        print("==============================================\n")
+        let meanMagnitude = fp32Magnitude / Float(totalElements)
+        let relativeError = meanError / max(meanMagnitude, 1e-8) * 100
+        
+        print("=== FP32 vs INT8 OUTPUT COMPARISON ===")
+        print("  FP32 output sample: [\(String(format: "%.4f", fp32Out[0])), \(String(format: "%.4f", fp32Out[1])), \(String(format: "%.4f", fp32Out[2])), ...]")
+        print("  INT8 output sample: [\(String(format: "%.4f", int8Out[0])), \(String(format: "%.4f", int8Out[1])), \(String(format: "%.4f", int8Out[2])), ...]")
+        print("  Mean Absolute Error: \(String(format: "%.6f", meanError))")
+        print("  Max Absolute Error:  \(String(format: "%.6f", maxError))")
+        print("  Relative Error:      \(String(format: "%.2f", relativeError))%\n")
+        
+        // ---- Verify with a larger "model-scale" layer ----
+        print("=== SCALE TEST (simulating real model layer) ===")
+        let bigInput = 1024
+        let bigOutput = 4096
+        let bigBatch = 1
+        let bigLayer = LinearLayer(engine: engine, inputDim: bigInput, outputDim: bigOutput, batchSize: bigBatch, useReLU: false)
+        let bigQuantized = QuantizedLinearLayer(engine: engine, from: bigLayer)
+        let bigFp32Bytes = bigInput * bigOutput * MemoryLayout<Float>.stride
+        print("  Layer: \(bigInput)×\(bigOutput) = \(bigInput * bigOutput) parameters")
+        print("  FP32: \(bigFp32Bytes / 1024) KB")
+        print("  INT8: \(bigQuantized.int8WeightBytes / 1024) KB")
+        print("  Savings: \(String(format: "%.1f", Float(bigFp32Bytes) / Float(bigQuantized.int8WeightBytes)))x compression\n")
         
         // ---- Verification ----
-        let allValid = sequence.allSatisfy { $0 < UInt32(vocabSize) }
-        let correctLength = sequence.count == maxSeqLen
-        // Cache holds K/V for all tokens except the very last (no prediction follows it)
-        let expectedCacheLen = sequence.count - 1
-        let cacheCorrect = cache.currentPosition == expectedCacheLen
+        let compressionPass = ratio > 3.5  // Should be close to 4x
+        let accuracyPass = relativeError < 5.0  // Less than 5% relative error
+        let outputFinite = (0..<totalElements).allSatisfy { !int8Out[$0].isNaN && !int8Out[$0].isInfinite }
         
+        print("==============================================")
         print("  Verification Results")
         print("==============================================")
-        print("  All tokens valid IDs:     \(allValid ? "✅ PASS" : "❌ FAIL")")
-        print("  Sequence length correct:  \(correctLength ? "✅ PASS" : "❌ FAIL")  [\(sequence.count)/\(maxSeqLen)]")
-        print("  KV Cache positions:       \(cacheCorrect ? "✅ PASS" : "❌ FAIL")  [\(cache.currentPosition)/\(expectedCacheLen) expected]")
+        print("  4x compression achieved:  \(compressionPass ? "✅ PASS" : "❌ FAIL")  [\(String(format: "%.1f", ratio))x]")
+        print("  Accuracy preserved (<5%): \(accuracyPass ? "✅ PASS" : "❌ FAIL")  [\(String(format: "%.2f", relativeError))%]")
+        print("  All outputs finite:       \(outputFinite ? "✅ PASS" : "❌ FAIL")")
         print("==============================================")
         
-        if allValid && correctLength && cacheCorrect {
-            print("\n🚀 Goal #9 COMPLETE: KV-Cached LLM inference on Apple Silicon!")
-            print("   Prefill: parallel prompt processing")
-            print("   Decode:  single-token generation with cached K/V")
-            print("   No redundant recomputation — this is how vLLM and TensorRT-LLM work.")
+        if compressionPass && accuracyPass && outputFinite {
+            print("\n🚀 Goal #10 COMPLETE: INT8 quantized inference on Apple Silicon!")
+            print("   Weights compressed 4x: FP32 → INT8 with per-row scaling")
+            print("   Dequantization happens on-the-fly inside GPU registers")
+            print("   This is the exact technique behind llama.cpp and GGML.")
         }
     }
 }

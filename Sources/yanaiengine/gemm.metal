@@ -327,3 +327,34 @@ kernel void embedding_lookup_kernel(
     uint tokenId = tokenIds[tokenIdx];
     output[tokenIdx * dModel + dim] = weights[tokenId * dModel + dim];
 }
+
+// INT8 Weight-Only Quantized GEMM: C = A * dequantize(B)
+// A: Float input activations [M x K]
+// B: INT8 quantized weights [K x N] (stored as char/int8)
+// scales: Float scale factors [K] (one per row of B)
+// C: Float output [M x N]
+// Dequantization: float_weight = int8_weight * scale[k]
+kernel void q8_gemm_kernel(
+    device const float* A [[buffer(0)]],
+    device const char* B [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* C [[buffer(3)]],
+    constant uint& M [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    
+    if (row >= M || col >= N) return;
+    
+    float sum = 0.0;
+    for (uint k = 0; k < K; k++) {
+        float a_val = A[row * K + k];
+        // Dequantize: read 1 byte, multiply by scale to recover approximate float
+        float b_val = float(B[k * N + col]) * scales[k];
+        sum += a_val * b_val;
+    }
+    C[row * N + col] = sum;
+}
