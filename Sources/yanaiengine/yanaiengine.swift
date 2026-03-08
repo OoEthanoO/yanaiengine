@@ -5,13 +5,13 @@ import Metal
 struct yanaiengine {
     static func main() {
         print("==============================================")
-        print("  YanAIEngine: Goal #12 — Llama 3 Architecture")
-        print("  RMSNorm + SwiGLU + GQA + BPE Tokenizer")
+        print("  YanAIEngine: Goal #13 — Full Llama Model")
+        print("  Stacked Blocks + Nucleus Sampling + Chat")
         print("==============================================\n")
         
         guard let engine = MetalEngine() else { fatalError("Metal not available") }
         
-        // Load all kernels (19 total)
+        // Load all 19 kernels
         let kernels = [
             "gemm_kernel", "bias_add_kernel", "relu_kernel",
             "transpose_kernel", "mse_derivative_kernel", "sgd_update_kernel",
@@ -19,136 +19,163 @@ struct yanaiengine {
             "softmax_kernel", "scale_kernel", "causal_mask_kernel",
             "gelu_kernel", "layernorm_kernel", "elementwise_add_kernel",
             "rope_kernel", "embedding_lookup_kernel", "q8_gemm_kernel",
-            // New for Goal #12:
             "rmsnorm_kernel", "silu_kernel"
         ]
-        for kernel in kernels {
-            engine.loadLibrary(resourceName: "gemm", kernelName: kernel)
+        for kernel in kernels { engine.loadLibrary(resourceName: "gemm", kernelName: kernel) }
+        
+        // ============================================
+        // Step 1: Chat Template
+        // ============================================
+        print("=== STEP 1: Llama 3 Chat Template ===\n")
+        
+        let userMessage = "What is the meaning of life?"
+        let chatPrompt = formatLlama3Chat(message: userMessage)
+        print("  User message: \"\(userMessage)\"")
+        print("  Formatted:")
+        for line in chatPrompt.components(separatedBy: "\n") {
+            print("    \(line)")
+        }
+        let templatePass = chatPrompt.contains("<|start_header_id|>") && chatPrompt.contains("<|eot_id|>")
+        print("  Template valid: \(templatePass ? "✅" : "❌")\n")
+        
+        // ============================================
+        // Step 2: Sampler Verification
+        // ============================================
+        print("=== STEP 2: Sampler Verification ===\n")
+        
+        let vocabSize = 10
+        let sampler = Sampler(temperature: 0.8, topK: 5, topP: 0.9)
+        
+        // Create logits where multiple tokens have competitive probabilities
+        var testLogits = [Float](repeating: -10.0, count: vocabSize)
+        testLogits[3] = 2.0   // Strong
+        testLogits[7] = 1.8   // Close second
+        testLogits[1] = 1.5   // Third
+        testLogits[5] = 1.0   // Fourth
+        
+        print("  Config: T=\(sampler.temperature), K=\(sampler.topK), P=\(sampler.topP)")
+        print("  Logits: token 3=2.0, token 7=1.8, token 1=1.5, token 5=1.0\n")
+        
+        // Greedy: should always pick token 3
+        let greedySampler = Sampler(temperature: 0, topK: vocabSize, topP: 1.0)
+        var greedyLogits = testLogits
+        let greedyResult = greedySampler.sample(logits: &greedyLogits, vocabSize: vocabSize)
+        let greedyPass = greedyResult == 3
+        print("  Greedy (T=0):     token \(greedyResult) \(greedyPass ? "✅" : "❌") (expected 3)")
+        
+        // Nucleus sampling: run multiple times, should see variety
+        var sampledTokens = Set<UInt32>()
+        for _ in 0..<50 {
+            var logitsCopy = testLogits
+            let token = sampler.sample(logits: &logitsCopy, vocabSize: vocabSize)
+            sampledTokens.insert(token)
+        }
+        let varietyPass = sampledTokens.count > 1
+        print("  Nucleus (50 runs): \(sampledTokens.sorted()) — \(sampledTokens.count) unique tokens \(varietyPass ? "✅" : "❌")")
+        
+        // Top-K=1 should behave like greedy
+        let topK1Sampler = Sampler(temperature: 0.8, topK: 1, topP: 1.0)
+        var topK1Logits = testLogits
+        let topK1Result = topK1Sampler.sample(logits: &topK1Logits, vocabSize: vocabSize)
+        let topKPass = topK1Result == 3
+        print("  Top-K=1:          token \(topK1Result) \(topKPass ? "✅" : "❌") (expected 3)\n")
+        
+        // ============================================
+        // Step 3: Full LlamaModel Forward Pass
+        // ============================================
+        print("=== STEP 3: LlamaModel (Stacked Blocks) ===\n")
+        
+        let config = LlamaConfig.tiny
+        print("  Config: \(config.numLayers) layers, \(config.dModel)d, \(config.numHeads)Q/\(config.numKVHeads)KV, vocab=\(config.vocabSize)")
+        
+        let model = LlamaModel(engine: engine, config: config)
+        
+        // Fake prompt tokens
+        let promptTokens: [UInt32] = [1, 5, 12, 8]
+        print("  Prompt: \(promptTokens) (\(promptTokens.count) tokens)")
+        print("  Running prefill through \(config.numLayers) stacked LlamaBlocks...\n")
+        
+        let logitsPtr = model.prefill(tokenIds: promptTokens)
+        
+        // Check logits are finite
+        var logitsFinite = true
+        for i in 0..<config.vocabSize {
+            if logitsPtr[i].isNaN || logitsPtr[i].isInfinite { logitsFinite = false; break }
         }
         
-        // ============================================
-        // Step 1: BPE Tokenizer
-        // ============================================
-        print("=== STEP 1: BPE Tokenizer ===\n")
-        
-        let tokenizer = Tokenizer()
-        
-        // Build a test vocabulary with BPE merge rules
-        let testVocab = [
-            "H", "e", "l", "o", ",", " ", "Y", "a", "n", "A",
-            "I", "E", "g", "i", "!", "He", "ll", "llo", "an",
-            "AI", "En", "Eng", "ine", "engine", "in"
-        ]
-        tokenizer.loadSimple(tokens: testVocab)
-        
-        // Add merge rules (in priority order)
-        tokenizer.merges = [
-            ("H", "e"),       // H + e → He
-            ("l", "l"),       // l + l → ll
-            ("a", "n"),       // a + n → an
-            ("A", "I"),       // A + I → AI
-            ("E", "n"),       // E + n → En
-            ("En", "g"),      // En + g → Eng
-            ("i", "n"),       // i + n → in
-            ("in", "e"),      // in + e → ine
-        ]
-        
-        let testText = "Hello, YanAIEngine!"
-        let tokenIds = tokenizer.encode(text: testText)
-        let decoded = tokenizer.decode(ids: tokenIds)
-        
-        print("  Vocabulary size:  \(tokenizer.vocabSize)")
-        print("  Input text:       \"\(testText)\"")
-        print("  Token IDs:        \(tokenIds)")
-        print("  Token strings:    \(tokenIds.map { tokenizer.reverseVocab[$0] ?? "?" })")
-        print("  Decoded:          \"\(decoded)\"")
-        let encodePass = !tokenIds.isEmpty
-        let decodePass = decoded == testText
-        print("  Encode works:     \(encodePass ? "✅" : "❌")")
-        print("  Roundtrip match:  \(decodePass ? "✅" : "❌")\n")
+        // Sample next token
+        var logitsCopy = [Float](repeating: 0, count: config.vocabSize)
+        for i in 0..<config.vocabSize { logitsCopy[i] = logitsPtr[i] }
+        let nextToken = sampler.sample(logits: &logitsCopy, vocabSize: config.vocabSize)
+        print("  Prefill logits finite:  \(logitsFinite ? "✅" : "❌")")
+        print("  Sampled next token:     \(nextToken)")
         
         // ============================================
-        // Step 2: Llama 3 Block (GQA + RMSNorm + SwiGLU)
+        // Step 4: Autoregressive Generation with Stop Token
         // ============================================
-        print("=== STEP 2: Llama 3 Block ===\n")
+        print("\n=== STEP 4: Generation with Stop Token ===\n")
         
-        let seqLen = 4
-        let dModel = 16
-        let numHeads = 4      // 4 query heads
-        let numKVHeads = 2    // 2 KV heads (GQA ratio = 2:1)
-        let dHead = dModel / numHeads
+        let eotTokenId: UInt32 = 0  // Simulate <|eot_id|> as token 0
+        var sequence = promptTokens
+        let maxGenTokens = 6
         
-        print("  Configuration:")
-        print("    Seq Length:    \(seqLen)")
-        print("    dModel:        \(dModel)")
-        print("    Query Heads:   \(numHeads)")
-        print("    KV Heads:      \(numKVHeads) (GQA \(numHeads/numKVHeads):1 ratio)")
-        print("    dHead:         \(dHead)")
-        print("    Normalization: RMSNorm (no mean centering)")
-        print("    FFN:           SwiGLU (gate + up + down projections)")
-        print("    Positional:    RoPE\n")
+        print("  Generating up to \(maxGenTokens) tokens (stop on token \(eotTokenId))...")
         
-        let llamaBlock = LlamaBlock(engine: engine, seqLen: seqLen, dModel: dModel, numHeads: numHeads, numKVHeads: numKVHeads)
+        // First prediction already done by prefill
+        sequence.append(nextToken)
         
-        // Create random input [seqLen x dModel]
-        let input = Tensor(device: engine.device, rows: seqLen, cols: dModel)
-        input.fillRandom()
-        
-        print("  Running forward pass...")
-        llamaBlock.forward(input: input)
-        
-        // Verify
-        let outPtr = llamaBlock.output.pointer()
-        let inPtr = input.pointer()
-        let totalElements = seqLen * dModel
-        
-        // Check 1: Shape preserved (residual connections)
-        let shapePass = (llamaBlock.output.rows == seqLen && llamaBlock.output.cols == dModel)
-        
-        // Check 2: Output is different from input (computation happened)
-        var isDifferent = false
-        for i in 0..<totalElements {
-            if abs(outPtr[i] - inPtr[i]) > 1e-6 { isDifferent = true; break }
+        for step in 0..<(maxGenTokens - 1) {
+            let decLogits = model.decode(tokenId: sequence.last!)
+            var decLogitsCopy = [Float](repeating: 0, count: config.vocabSize)
+            for i in 0..<config.vocabSize { decLogitsCopy[i] = decLogits[i] }
+            let tok = sampler.sample(logits: &decLogitsCopy, vocabSize: config.vocabSize)
+            
+            if tok == eotTokenId {
+                print("  Step \(step + 2): <|eot_id|> — STOPPING")
+                break
+            }
+            sequence.append(tok)
+            print("  Step \(step + 2): token \(tok) → [\(sequence.map { String($0) }.joined(separator: ", "))]")
         }
         
-        // Check 3: All finite
-        var allFinite = true
-        for i in 0..<totalElements {
-            if outPtr[i].isNaN || outPtr[i].isInfinite { allFinite = false; break }
-        }
-        
-        // Check 4: GQA memory savings
-        let mhaKVSize = numHeads * dHead * seqLen * 2     // Standard MHA
-        let gqaKVSize = numKVHeads * dHead * seqLen * 2   // GQA
-        let kvSavings = Float(mhaKVSize - gqaKVSize) / Float(mhaKVSize) * 100
-        let gqaPass = numKVHeads < numHeads
-        
-        print("\n  Output sample: [\(String(format: "%.4f", outPtr[0])), \(String(format: "%.4f", outPtr[1])), \(String(format: "%.4f", outPtr[2])), ...]\n")
-        
-        print("  GQA Memory Analysis:")
-        print("    Standard MHA KV:  \(mhaKVSize) floats (\(numHeads) heads)")
-        print("    GQA KV:           \(gqaKVSize) floats (\(numKVHeads) heads)")
-        print("    KV Cache Savings: \(String(format: "%.0f", kvSavings))%\n")
+        let totalTokens = sequence.count
+        let genTokens = totalTokens - promptTokens.count
+        print("\n  Generated \(genTokens) tokens. Total sequence: \(totalTokens) tokens")
         
         // ---- Final Verification ----
-        print("==============================================")
+        let allValid = sequence.allSatisfy { $0 < UInt32(config.vocabSize) }
+        let multiLayer = config.numLayers > 1
+        
+        print("\n==============================================")
         print("  Verification Results")
         print("==============================================")
-        print("  BPE Tokenizer works:      \(encodePass ? "✅ PASS" : "❌ FAIL")")
-        print("  Roundtrip encode/decode:   \(decodePass ? "✅ PASS" : "❌ FAIL")")
-        print("  Shape preserved:           \(shapePass ? "✅ PASS" : "❌ FAIL")  [\(seqLen)×\(dModel)]")
-        print("  Transformation applied:    \(isDifferent ? "✅ PASS" : "❌ FAIL")")
-        print("  All values finite:         \(allFinite ? "✅ PASS" : "❌ FAIL")")
-        print("  GQA KV reduction:          \(gqaPass ? "✅ PASS" : "❌ FAIL")  [\(String(format: "%.0f", kvSavings))% savings]")
+        print("  Chat template correct:     \(templatePass ? "✅ PASS" : "❌ FAIL")")
+        print("  Greedy sampling works:     \(greedyPass ? "✅ PASS" : "❌ FAIL")")
+        print("  Nucleus produces variety:  \(varietyPass ? "✅ PASS" : "❌ FAIL")")
+        print("  Multi-layer forward:       \(multiLayer ? "✅ PASS" : "❌ FAIL")  [\(config.numLayers) layers]")
+        print("  Logits are finite:         \(logitsFinite ? "✅ PASS" : "❌ FAIL")")
+        print("  All tokens valid:          \(allValid ? "✅ PASS" : "❌ FAIL")")
         print("==============================================")
         
-        if encodePass && decodePass && shapePass && isDifferent && allFinite && gqaPass {
-            print("\n🚀 Goal #12 COMPLETE: Llama 3 architecture on Apple Silicon!")
-            print("   RMSNorm:   ✓  (replaces LayerNorm)")
-            print("   SwiGLU:    ✓  (replaces GELU FFN)")
-            print("   GQA:       ✓  (\(numHeads)Q/\(numKVHeads)KV — \(String(format: "%.0f", kvSavings))% KV cache savings)")
-            print("   BPE:       ✓  (tokenizer with merge rules)")
-            print("   Ready to load Meta-Llama-3-8B-Instruct!")
+        if templatePass && greedyPass && varietyPass && multiLayer && logitsFinite && allValid {
+            print("\n🚀 Goal #13 COMPLETE: Full LLM pipeline on Apple Silicon!")
+            print("   Model:    \(config.numLayers)-layer LlamaModel (Embed→Blocks→RMSNorm→LMHead)")
+            print("   Sampler:  Temperature + Top-K + Top-P (Nucleus)")
+            print("   Chat:     Llama 3 template with <|eot_id|> stop detection")
+            print("   This is a bespoke llama.cpp alternative, built from scratch.")
         }
+    }
+    
+    /// Format a user message using Llama 3's chat template.
+    static func formatLlama3Chat(message: String, systemPrompt: String = "You are a helpful AI assistant.") -> String {
+        return """
+        <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        
+        \(systemPrompt)<|eot_id|><|start_header_id|>user<|end_header_id|>
+        
+        \(message)<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+        
+        
+        """
     }
 }

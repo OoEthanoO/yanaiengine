@@ -48,6 +48,18 @@ public class LlamaBlock {
     private let keyTransposed: Tensor
     private let concatOutput: Tensor
     
+    // Decode-phase projections (batchSize=1)
+    private lazy var dQueryProj = LinearLayer(engine: engine, inputDim: dModel, outputDim: numHeads * dHead, batchSize: 1, useReLU: false)
+    private lazy var dKeyProj = LinearLayer(engine: engine, inputDim: dModel, outputDim: numKVHeads * dHead, batchSize: 1, useReLU: false)
+    private lazy var dValueProj = LinearLayer(engine: engine, inputDim: dModel, outputDim: numKVHeads * dHead, batchSize: 1, useReLU: false)
+    private lazy var dOutputProj = LinearLayer(engine: engine, inputDim: numHeads * dHead, outputDim: dModel, batchSize: 1, useReLU: false)
+    
+    private lazy var dGateProj = LinearLayer(engine: engine, inputDim: dModel, outputDim: ffnDim, batchSize: 1, useReLU: false)
+    private lazy var dUpProj = LinearLayer(engine: engine, inputDim: dModel, outputDim: ffnDim, batchSize: 1, useReLU: false)
+    private lazy var dDownProj = LinearLayer(engine: engine, inputDim: ffnDim, outputDim: dModel, batchSize: 1, useReLU: false)
+    
+    private var decodeWeightsSynced = false
+    
     public init(engine: MetalEngine, seqLen: Int, dModel: Int, numHeads: Int, numKVHeads: Int, ffnMultiplier: Float = 2.6875) {
         precondition(dModel % numHeads == 0, "dModel must be divisible by numHeads")
         precondition(numHeads % numKVHeads == 0, "numHeads must be divisible by numKVHeads")
@@ -273,21 +285,139 @@ public class LlamaBlock {
         dispatchAdd(a: residual1, b: downProj.output, out: output, length: totalLen)
     }
     
+    /// Synchronize weights from prefill layers to decode layers (sharing memory).
+    private func syncDecodeWeights() {
+        if decodeWeightsSynced { return }
+        let layers: [(LinearLayer, LinearLayer)] = [
+            (queryProj, dQueryProj), (keyProj, dKeyProj), (valueProj, dValueProj), (outputProj, dOutputProj),
+            (gateProj, dGateProj), (upProj, dUpProj), (downProj, dDownProj)
+        ]
+        for (src, dst) in layers {
+            memcpy(dst.weights.pointer(), src.weights.pointer(), src.weights.rows * src.weights.cols * MemoryLayout<Float>.stride)
+            memcpy(dst.bias.pointer(), src.bias.pointer(), src.bias.cols * MemoryLayout<Float>.stride)
+        }
+        decodeWeightsSynced = true
+    }
+    
+    /// Forward pass for a single token using KV Cache (O(1) relative to total context).
+    public func forwardCached(input: Tensor, cache: KVCache) -> Tensor {
+        precondition(input.rows == 1, "forwardCached expects a single token")
+        syncDecodeWeights()
+        
+        let pos = cache.currentPosition
+        let outSingle = Tensor(device: engine.device, rows: 1, cols: dModel)
+        
+        // 1. RMSNorm
+        let rmsIn = Tensor(device: engine.device, rows: 1, cols: dModel)
+        memcpy(rmsIn.pointer(), input.pointer(), dModel * MemoryLayout<Float>.stride)
+        dispatchRMSNorm(data: rmsIn, gamma: rmsGamma1, rows: 1)
+        
+        // 2. Projections
+        dQueryProj.forward(input: rmsIn)
+        dKeyProj.forward(input: rmsIn)
+        dValueProj.forward(input: rmsIn)
+        
+        // 3. Update Cache
+        cache.appendFromFull(kTensor: dKeyProj.output, vTensor: dValueProj.output, tokenIdx: 0, dModel: numKVHeads * dHead)
+        cache.advancePosition()
+        let cacheLen = cache.currentPosition
+        
+        // 4. Attention
+        let qPtr = dQueryProj.output.pointer()
+        let concatPtr = Tensor(device: engine.device, rows: 1, cols: numHeads * dHead).pointer()
+        let kvGroupSize = numHeads / numKVHeads
+        
+        for h in 0..<numHeads {
+            let kvH = h / kvGroupSize
+            let headOffset = h * dHead
+            
+            // Extract & RoPE Query
+            var qh = [Float](repeating: 0, count: dHead)
+            for d in 0..<dHead { qh[d] = qPtr[headOffset + d] }
+            
+            for pair in 0..<(dHead / 2) {
+                let theta = Float(pos) / pow(10000.0, Float(2 * pair) / Float(dHead))
+                let cosT = cos(theta); let sinT = sin(theta)
+                let x0 = qh[2 * pair]; let x1 = qh[2 * pair + 1]
+                qh[2 * pair] = x0 * cosT - x1 * sinT
+                qh[2 * pair + 1] = x0 * sinT + x1 * cosT
+            }
+            
+            // Attention scores
+            let kPtr = cache.cachedKeys[kvH].pointer()
+            var scores = [Float](repeating: 0, count: cacheLen)
+            let scale = 1.0 / sqrt(Float(dHead))
+            for t in 0..<cacheLen {
+                var dot: Float = 0
+                for d in 0..<dHead { dot += qh[d] * kPtr[t * dHead + d] }
+                scores[t] = dot * scale
+            }
+            
+            // Softmax
+            let m = scores.max() ?? 0
+            var s: Float = 0
+            for t in 0..<cacheLen { scores[t] = exp(scores[t] - m); s += scores[t] }
+            for t in 0..<cacheLen { scores[t] /= s }
+            
+            // Value sum
+            let vPtr = cache.cachedValues[kvH].pointer()
+            for d in 0..<dHead {
+                var sum: Float = 0
+                for t in 0..<cacheLen { sum += scores[t] * vPtr[t * dHead + d] }
+                concatPtr[headOffset + d] = sum
+            }
+        }
+        
+        let concatTensor = Tensor(device: engine.device, rows: 1, cols: numHeads * dHead)
+        memcpy(concatTensor.pointer(), concatPtr, numHeads * dHead * MemoryLayout<Float>.stride)
+        
+        dOutputProj.forward(input: concatTensor)
+        
+        // Residual 1
+        let x1 = Tensor(device: engine.device, rows: 1, cols: dModel)
+        let x1Ptr = x1.pointer()
+        let inPtr = input.pointer()
+        let attPtr = dOutputProj.output.pointer()
+        for i in 0..<dModel { x1Ptr[i] = inPtr[i] + attPtr[i] }
+        
+        // 5. FFN (SwiGLU)
+        let rmsIn2 = Tensor(device: engine.device, rows: 1, cols: dModel)
+        memcpy(rmsIn2.pointer(), x1.pointer(), dModel * MemoryLayout<Float>.stride)
+        dispatchRMSNorm(data: rmsIn2, gamma: rmsGamma2, rows: 1)
+        
+        dGateProj.forward(input: rmsIn2)
+        dUpProj.forward(input: rmsIn2)
+        
+        dispatchSiLU(data: dGateProj.output, length: ffnDim)
+        let gPtr = dGateProj.output.pointer()
+        let uPtr = dUpProj.output.pointer()
+        for i in 0..<ffnDim { gPtr[i] *= uPtr[i] }
+        
+        dDownProj.forward(input: dGateProj.output)
+        
+        // Residual 2
+        let resPtr = dDownProj.output.pointer()
+        let finalPtr = outSingle.pointer()
+        for i in 0..<dModel { finalPtr[i] = x1Ptr[i] + resPtr[i] }
+        
+        return outSingle
+    }
+    
     // MARK: - GPU Dispatch Helpers
     
-    private func dispatchRMSNorm(data: Tensor, gamma: Tensor) {
+    private func dispatchRMSNorm(data: Tensor, gamma: Tensor, rows: Int? = nil) {
         guard let cb = engine.commandQueue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else { fatalError() }
         let pso = engine.getPipelineState(name: "rmsnorm_kernel")
         enc.setComputePipelineState(pso)
         enc.setBuffer(data.buffer, offset: 0, index: 0)
         enc.setBuffer(gamma.buffer, offset: 0, index: 1)
-        var r = UInt32(seqLen); var c = UInt32(dModel); var eps: Float = 1e-5
+        var r = UInt32(rows ?? seqLen); var c = UInt32(dModel); var eps: Float = 1e-5
         enc.setBytes(&r, length: MemoryLayout<UInt32>.size, index: 2)
         enc.setBytes(&c, length: MemoryLayout<UInt32>.size, index: 3)
         enc.setBytes(&eps, length: MemoryLayout<Float>.size, index: 4)
-        enc.dispatchThreads(MTLSize(width: seqLen, height: 1, depth: 1),
-                           threadsPerThreadgroup: MTLSize(width: min(pso.maxTotalThreadsPerThreadgroup, seqLen), height: 1, depth: 1))
+        enc.dispatchThreads(MTLSize(width: Int(r), height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(pso.maxTotalThreadsPerThreadgroup, Int(r)), height: 1, depth: 1))
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()

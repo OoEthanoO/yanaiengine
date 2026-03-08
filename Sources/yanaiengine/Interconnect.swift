@@ -5,11 +5,11 @@ import NIO
 public enum Interconnect {
     
     /// A channel handler that receives raw bytes and triggers a callback with a Data object.
-    internal class TensorHandler: ChannelInboundHandler {
+    internal final class TensorHandler: ChannelInboundHandler, @unchecked Sendable {
         typealias InboundIn = ByteBuffer
-        let onReceived: (Data, Channel) -> Void
+        let onReceived: @Sendable (Data, Channel) -> Void
         
-        init(onReceived: @escaping (Data, Channel) -> Void) {
+        init(onReceived: @escaping @Sendable (Data, Channel) -> Void) {
             self.onReceived = onReceived
         }
         
@@ -22,7 +22,7 @@ public enum Interconnect {
     }
     
     /// Acts as the Master node, listening for gradient updates from workers.
-    public class Server {
+    public class Server: @unchecked Sendable {
         private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         private var channel: Channel?
         private var lastWorkerChannel: Channel?
@@ -35,10 +35,11 @@ public enum Interconnect {
             let bootstrap = ServerBootstrap(group: group)
                 .serverChannelOption(ChannelOptions.backlog, value: 256)
                 .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-                .childChannelInitializer { [weak self] channel in
-                    self?.lastWorkerChannel = channel
+                .childChannelInitializer { channel in
+                    let server = self
+                    server.lastWorkerChannel = channel
                     return channel.pipeline.addHandler(TensorHandler(onReceived: { data, _ in
-                        self?.onGradientReceived?(data)
+                        server.onGradientReceived?(data)
                     }))
                 }
             
@@ -63,7 +64,7 @@ public enum Interconnect {
     }
     
     /// Acts as the Worker node, sending gradients to the Master.
-    public class Client {
+    public class Client: @unchecked Sendable {
         private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         private var channel: Channel?
         
@@ -74,9 +75,10 @@ public enum Interconnect {
         public func connect(host: String, port: Int) throws {
             let bootstrap = ClientBootstrap(group: group)
                 .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-                .channelInitializer { [weak self] channel in
-                    channel.pipeline.addHandler(TensorHandler(onReceived: { data, _ in
-                        self?.onDataReceived?(data)
+                .channelInitializer { channel in
+                    let client = self
+                    return channel.pipeline.addHandler(TensorHandler(onReceived: { data, _ in
+                        client.onDataReceived?(data)
                     }))
                 }
             channel = try bootstrap.connect(host: host, port: port).wait()

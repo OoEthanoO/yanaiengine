@@ -6,6 +6,7 @@ import Foundation
 public class EmbeddingLayer {
     public let weights: Tensor
     public let output: Tensor
+    public let decodeOutput: Tensor
     private let engine: MetalEngine
     public let vocabSize: Int
     public let dModel: Int
@@ -22,6 +23,7 @@ public class EmbeddingLayer {
         
         self.weights = Tensor(device: engine.device, rows: vocabSize, cols: dModel)
         self.output = Tensor(device: engine.device, rows: maxSeqLen, cols: dModel)
+        self.decodeOutput = Tensor(device: engine.device, rows: 1, cols: dModel)
         
         // Allocate buffer for token IDs
         self.tokenBuffer = engine.device.makeBuffer(
@@ -57,6 +59,31 @@ public class EmbeddingLayer {
         enc.setBytes(&dm, length: MemoryLayout<UInt32>.size, index: 4)
         enc.dispatchThreads(MTLSize(width: dModel, height: seqLen, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+    }
+    
+    /// Lookup for a single token ID (optimized for decode).
+    public func forwardDecode(tokenId: UInt32) {
+        let ptr = tokenBuffer.contents().bindMemory(to: UInt32.self, capacity: maxSeqLen)
+        ptr[0] = tokenId
+        
+        guard let cb = engine.commandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { fatalError() }
+        
+        let pso = engine.getPipelineState(name: "embedding_lookup_kernel")
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(tokenBuffer, offset: 0, index: 0)
+        enc.setBuffer(weights.buffer, offset: 0, index: 1)
+        enc.setBuffer(decodeOutput.buffer, offset: 0, index: 2)
+        var sl: UInt32 = 1
+        var dm = UInt32(dModel)
+        enc.setBytes(&sl, length: MemoryLayout<UInt32>.size, index: 3)
+        enc.setBytes(&dm, length: MemoryLayout<UInt32>.size, index: 4)
+        enc.dispatchThreads(MTLSize(width: dModel, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(pso.maxTotalThreadsPerThreadgroup, dModel), height: 1, depth: 1))
         
         enc.endEncoding()
         cb.commit()
