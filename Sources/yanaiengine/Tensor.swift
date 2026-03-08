@@ -65,4 +65,34 @@ public struct Tensor {
         }
         print("---")
     }
+    
+    // MARK: - Distributed Utilities
+    
+    /// Serializes the tensor data into a Data object for network transmission.
+    public func serialize() -> Data {
+        let byteCount = rows * cols * MemoryLayout<Float>.stride
+        return Data(bytes: buffer.contents(), count: byteCount)
+    }
+    
+    /// Deserializes data from a Data object into the tensor's buffer.
+    public func deserialize(from data: Data) {
+        let byteCount = rows * cols * MemoryLayout<Float>.stride
+        guard data.count == byteCount else {
+            fatalError("Data size mismatch during deserialization")
+        }
+        data.withUnsafeBytes { (rawPtr: UnsafeRawBufferPointer) in
+            guard let baseAddress = rawPtr.baseAddress else { return }
+            memcpy(buffer.contents(), baseAddress, byteCount)
+        }
+    }
+    
+    /// Calculates the mean of this tensor and another tensor, storing the result in this tensor.
+    /// Used for gradient averaging in Distributed Data Parallel (DDP).
+    public func average(with other: Tensor) {
+        let ptrSelf = pointer()
+        let ptrOther = other.pointer()
+        for i in 0..<(rows * cols) {
+            ptrSelf[i] = (ptrSelf[i] + ptrOther[i]) / 2.0
+        }
+    }
 }

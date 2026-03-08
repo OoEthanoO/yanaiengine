@@ -27,12 +27,22 @@ public class Sequential {
     ///   - lossGradient: The gradient of the loss with respect to the output.
     ///   - learningRate: The step size for SGD.
     public func backward(lossGradient: Tensor, learningRate: Float) {
+        computeGradients(lossGradient: lossGradient)
+        applyUpdates(learningRate: learningRate)
+    }
+    
+    /// Computes gradients for all layers but does not update them.
+    public func computeGradients(lossGradient: Tensor) {
         var currentGradient = lossGradient
-        
-        // Iterate backward through the layers
         for layer in layers.reversed() {
-            // backward() now returns dX (inputGradient), which becomes currentGradient for the previous layer
-            currentGradient = layer.backward(upstreamGradient: currentGradient, learningRate: learningRate)
+            currentGradient = layer.computeGradients(upstreamGradient: currentGradient)
+        }
+    }
+    
+    /// Applies updates to all layers.
+    public func applyUpdates(learningRate: Float) {
+        for layer in layers {
+            layer.applyUpdates(learningRate: learningRate)
         }
     }
 }

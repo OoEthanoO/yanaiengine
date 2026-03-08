@@ -5,11 +5,15 @@ import PackageDescription
 
 let package = Package(
     name: "yanaiengine",
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.0.0"),
+    ],
     targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
         .executableTarget(
             name: "yanaiengine",
+            dependencies: [
+                .product(name: "NIO", package: "swift-nio"),
+            ],
             resources: [.process("gemm.metal")]
         ),
     ]

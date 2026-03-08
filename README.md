@@ -9,19 +9,21 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Zero-Copy Memory Bridge**: `Tensor` structures backed by `MTLBuffer` with shared storage mode.
 - [x] **Deep Learning & Chain Rule**: Full backpropagation support across multiple layers.
 - [x] **Sequential Model Abstraction**: Stackable `LinearLayer` components managed by a `Sequential` container.
-- [x] **Non-Linear Solving**: Successfully trained to solve the XOR problem natively on the GPU.
+- [x] **Goal #4: Non-Linear Solving**: Successfully trained to solve the XOR problem natively on the GPU.
+- [x] **Goal #5: Distributed Interconnect**: Multi-node synchronization via **SwiftNIO** with All-Reduce gradient averaging.
 - [x] **Bare-Metal Kernels**: Hand-written MSL for GEMM, Transposition, Bias Addition, Row Summing, MSE Derivative, ReLU Derivative, and SGD Optimization.
 
 ## Architecture
 
 | Component | Description |
 |-----------|-------------|
-| `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory. |
+| `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
+| `Interconnect.swift` | The network layer. High-performance, asynchronous TCP bridge using **SwiftNIO**. |
 | `Sequential.swift` | The orchestrator. Chains layers and manages the multi-layer forward/backward flow. |
 | `LinearLayer.swift` | The building block. Manages parameters, calculates gradients (dW, db, dX), and applies optimization. |
 | `gemm.metal` | The math. Optimized kernels for linear algebra and deep learning operations. |
-| `yanaiengine.swift` | The entry point. Demonstrates a multi-layer training loop solving the XOR problem. |
+| `yanaiengine.swift` | The entry point. Supports standalone, Master, and Worker roles for distributed training. |
 
 ## Quick Start
 
@@ -29,12 +31,20 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - A Mac with **Apple Silicon** (M1, M2, M3 series).
 - **Xcode 15+** or the **Swift 6.0+** toolchain.
 
-### Running the Training Demo
+### Running the Distributed Demo
+To test the interconnect on a single machine, open two terminals:
+
+**Terminal 1 (Master):**
 ```bash
-cd yanaiengine
-swift run
+swift run yanaiengine --master
 ```
-The demo will train a 2-layer neural network (2 -> 16 -> 1) to solve the **XOR Problem**, demonstrating non-linear learning convergence over 2000 epochs.
+
+**Terminal 2 (Worker):**
+```bash
+swift run yanaiengine --worker
+```
+
+The nodes will automatically discover each other, split the XOR dataset, and synchronize gradients using the **All-Reduce** protocol over TCP.
 
 ### Running via Xcode
 1. In Xcode, select **File > Open...** and select the `yanaiengine` folder (or `Package.swift`).

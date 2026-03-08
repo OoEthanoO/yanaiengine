@@ -116,18 +116,10 @@ public class LinearLayer {
         commandBuffer.waitUntilCompleted()
     }
     
-    /// Performs the backward pass, updates parameters, and returns input gradients.
-    /// Y = ReLU(XW + b) => 
-    /// 1. dY' = dY * ReLU'(linear_output)
-    /// 2. dW = X^T * dY'
-    /// 3. db = sum(dY')
-    /// 4. dX = dY' * W^T
-    /// - Parameters:
-    ///   - upstreamGradient: The gradient dY (batchSize x outputDim).
-    ///   - learningRate: The step size for SGD.
-    /// - Returns: The gradient with respect to the input (dX).
+    /// Computes gradients (dW, db, dX) but DOES NOT update weights/biases.
+    /// Used in distributed training where gradients must be averaged before updating.
     @discardableResult
-    public func backward(upstreamGradient: Tensor, learningRate: Float) -> Tensor {
+    public func computeGradients(upstreamGradient: Tensor) -> Tensor {
         guard let input = lastInput else {
             fatalError("forward() must be called before backward()")
         }
@@ -137,7 +129,7 @@ public class LinearLayer {
             fatalError("Failed to create command buffer or encoder")
         }
         
-        // 0. Apply ReLU Derivative: upstreamGradient = upstreamGradient * (output > 0 ? 1 : 0)
+        // 0. Apply ReLU Derivative
         if useReLU {
             let reluDerivPSO = engine.getPipelineState(name: "relu_derivative_kernel")
             encoder.setComputePipelineState(reluDerivPSO)
@@ -219,7 +211,20 @@ public class LinearLayer {
         
         encoder.dispatchThreads(MTLSize(width: Int(N_dX), height: Int(M_dX), depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         
-        // 4. SGD Update: W = W - lr * dW
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        
+        return inputGradients
+    }
+    
+    /// Applies SGD updates to weights and biases.
+    public func applyUpdates(learningRate: Float) {
+        guard let commandBuffer = engine.commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            fatalError("Failed to create command buffer or encoder")
+        }
+        
         let updatePSO = engine.getPipelineState(name: "sgd_update_kernel")
         encoder.setComputePipelineState(updatePSO)
         encoder.setBuffer(weights.buffer, offset: 0, index: 0)
@@ -231,7 +236,7 @@ public class LinearLayer {
         
         encoder.dispatchThreads(MTLSize(width: Int(wLength), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         
-        // B. Update Biases: b = b - lr * db
+        // Update Biases: b = b - lr * db
         encoder.setComputePipelineState(updatePSO)
         encoder.setBuffer(bias.buffer, offset: 0, index: 0)
         encoder.setBuffer(biasGradients.buffer, offset: 0, index: 1)
@@ -244,7 +249,13 @@ public class LinearLayer {
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        
-        return inputGradients
+    }
+    
+    /// Compatibility method for existing training loops.
+    @discardableResult
+    public func backward(upstreamGradient: Tensor, learningRate: Float) -> Tensor {
+        let dX = computeGradients(upstreamGradient: upstreamGradient)
+        applyUpdates(learningRate: learningRate)
+        return dX
     }
 }
