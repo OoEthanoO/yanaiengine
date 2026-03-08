@@ -111,3 +111,41 @@ kernel void sgd_update_kernel(
     
     param[gid] -= lr * gradient[gid];
 }
+
+// Kernel to calculate the derivative of ReLU: grad_out = grad_in * (original_output > 0 ? 1 : 0)
+kernel void relu_derivative_kernel(
+    device float* grad_in_out [[buffer(0)]],
+    device const float* original_output [[buffer(1)]],
+    constant uint& length [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) {
+        return;
+    }
+    
+    // If the forward pass output was 0 (clamped), the gradient is blocked (0)
+    if (original_output[gid] <= 0.0) {
+        grad_in_out[gid] = 0.0;
+    }
+    // Otherwise, gradient passes through (multiplied by 1)
+}
+
+// Kernel to sum rows of a matrix (used for bias gradient accumulation)
+// Output = sum(Input, dim=0)
+kernel void sum_rows_kernel(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= cols) {
+        return;
+    }
+    
+    float sum = 0.0;
+    for (uint r = 0; r < rows; r++) {
+        sum += input[r * cols + gid];
+    }
+    output[gid] = sum;
+}

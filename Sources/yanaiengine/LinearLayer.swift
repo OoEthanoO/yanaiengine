@@ -11,10 +11,13 @@ public class LinearLayer {
     // Gradient and intermediate storage for training
     public let weightGradients: Tensor
     public let biasGradients: Tensor
+    public let inputGradients: Tensor
     private var lastInput: Tensor?
     private let transposedInput: Tensor
+    private let transposedWeights: Tensor
     
     private let engine: MetalEngine
+    private let useReLU: Bool
     
     /// Initializes a Linear Layer with the given dimensions.
     ///
@@ -23,8 +26,9 @@ public class LinearLayer {
     ///   - inputDim: The size of the input vector (cols of input / rows of weights).
     ///   - outputDim: The size of the output vector (cols of weights / cols of bias).
     ///   - batchSize: The number of rows in the input matrix.
-    public init(engine: MetalEngine, inputDim: Int, outputDim: Int, batchSize: Int) {
+    public init(engine: MetalEngine, inputDim: Int, outputDim: Int, batchSize: Int, useReLU: Bool = true) {
         self.engine = engine
+        self.useReLU = useReLU
         
         // Weights: [inputDim x outputDim]
         self.weights = Tensor(device: engine.device, rows: inputDim, cols: outputDim)
@@ -38,9 +42,13 @@ public class LinearLayer {
         // Gradient buffers match parameter dimensions
         self.weightGradients = Tensor(device: engine.device, rows: inputDim, cols: outputDim)
         self.biasGradients = Tensor(device: engine.device, rows: 1, cols: outputDim)
+        self.inputGradients = Tensor(device: engine.device, rows: batchSize, cols: inputDim)
         
-        // Scratch buffer for matrix transpose: X is [batchSize x inputDim], so X^T is [inputDim x batchSize]
+        // Scratch buffers for matrix transpose
+        // X^T is [inputDim x batchSize]
         self.transposedInput = Tensor(device: engine.device, rows: inputDim, cols: batchSize)
+        // W^T is [outputDim x inputDim]
+        self.transposedWeights = Tensor(device: engine.device, rows: outputDim, cols: inputDim)
         
         // Initialize weights/bias with some values
         weights.fillRandom()
@@ -89,15 +97,17 @@ public class LinearLayer {
         encoder.dispatchThreads(gemmThreadsPerGrid, threadsPerThreadgroup: gemmThreadsPerTG)
         
         // 3. Dispatch ReLU: output = max(0, output)
-        let reluPSO = engine.getPipelineState(name: "relu_kernel")
-        encoder.setComputePipelineState(reluPSO)
-        encoder.setBuffer(output.buffer, offset: 0, index: 0)
-        var totalLength = UInt32(output.rows * output.cols)
-        encoder.setBytes(&totalLength, length: MemoryLayout<UInt32>.size, index: 1)
-        
-        let reluThreadsPerGrid = MTLSize(width: Int(totalLength), height: 1, depth: 1)
-        let reluThreadsPerTG = MTLSize(width: min(reluPSO.maxTotalThreadsPerThreadgroup, Int(totalLength)), height: 1, depth: 1)
-        encoder.dispatchThreads(reluThreadsPerGrid, threadsPerThreadgroup: reluThreadsPerTG)
+        if useReLU {
+            let reluPSO = engine.getPipelineState(name: "relu_kernel")
+            encoder.setComputePipelineState(reluPSO)
+            encoder.setBuffer(output.buffer, offset: 0, index: 0)
+            var totalLength = UInt32(output.rows * output.cols)
+            encoder.setBytes(&totalLength, length: MemoryLayout<UInt32>.size, index: 1)
+            
+            let reluThreadsPerGrid = MTLSize(width: Int(totalLength), height: 1, depth: 1)
+            let reluThreadsPerTG = MTLSize(width: min(reluPSO.maxTotalThreadsPerThreadgroup, Int(totalLength)), height: 1, depth: 1)
+            encoder.dispatchThreads(reluThreadsPerGrid, threadsPerThreadgroup: reluThreadsPerTG)
+        }
         
         encoder.endEncoding()
         
@@ -106,12 +116,18 @@ public class LinearLayer {
         commandBuffer.waitUntilCompleted()
     }
     
-    /// Performs the backward pass and updates weights/biases using SGD.
-    /// Y = XW + b  =>  dW = X^T * dY,  db = sum(dY)
+    /// Performs the backward pass, updates parameters, and returns input gradients.
+    /// Y = ReLU(XW + b) => 
+    /// 1. dY' = dY * ReLU'(linear_output)
+    /// 2. dW = X^T * dY'
+    /// 3. db = sum(dY')
+    /// 4. dX = dY' * W^T
     /// - Parameters:
     ///   - upstreamGradient: The gradient dY (batchSize x outputDim).
     ///   - learningRate: The step size for SGD.
-    public func backward(upstreamGradient: Tensor, learningRate: Float) {
+    /// - Returns: The gradient with respect to the input (dX).
+    @discardableResult
+    public func backward(upstreamGradient: Tensor, learningRate: Float) -> Tensor {
         guard let input = lastInput else {
             fatalError("forward() must be called before backward()")
         }
@@ -121,25 +137,34 @@ public class LinearLayer {
             fatalError("Failed to create command buffer or encoder")
         }
         
+        // 0. Apply ReLU Derivative: upstreamGradient = upstreamGradient * (output > 0 ? 1 : 0)
+        if useReLU {
+            let reluDerivPSO = engine.getPipelineState(name: "relu_derivative_kernel")
+            encoder.setComputePipelineState(reluDerivPSO)
+            encoder.setBuffer(upstreamGradient.buffer, offset: 0, index: 0)
+            encoder.setBuffer(output.buffer, offset: 0, index: 1)
+            var totalLength = UInt32(output.rows * output.cols)
+            encoder.setBytes(&totalLength, length: MemoryLayout<UInt32>.size, index: 2)
+            
+            let reluThreadsPerGrid = MTLSize(width: Int(totalLength), height: 1, depth: 1)
+            let reluThreadsPerTG = MTLSize(width: min(reluDerivPSO.maxTotalThreadsPerThreadgroup, Int(totalLength)), height: 1, depth: 1)
+            encoder.dispatchThreads(reluThreadsPerGrid, threadsPerThreadgroup: reluThreadsPerTG)
+        }
+        
         // 1. Transpose Input: X -> X^T
-        // dimensions for transpose: input is [batchSize x inputDim]
         let transPSO = engine.getPipelineState(name: "transpose_kernel")
         encoder.setComputePipelineState(transPSO)
         encoder.setBuffer(input.buffer, offset: 0, index: 0)
         encoder.setBuffer(transposedInput.buffer, offset: 0, index: 1)
-        var rows = UInt32(input.rows)
-        var cols = UInt32(input.cols)
-        encoder.setBytes(&rows, length: MemoryLayout<UInt32>.size, index: 2)
-        encoder.setBytes(&cols, length: MemoryLayout<UInt32>.size, index: 3)
+        var x_rows = UInt32(input.rows)
+        var x_cols = UInt32(input.cols)
+        encoder.setBytes(&x_rows, length: MemoryLayout<UInt32>.size, index: 2)
+        encoder.setBytes(&x_cols, length: MemoryLayout<UInt32>.size, index: 3)
         
-        let transThreadsPerGrid = MTLSize(width: Int(cols), height: Int(rows), depth: 1)
-        let transThreadsPerTG = MTLSize(width: min(transPSO.threadExecutionWidth, Int(cols)), 
-                                       height: min(transPSO.maxTotalThreadsPerThreadgroup / transPSO.threadExecutionWidth, Int(rows)), 
-                                       depth: 1)
-        encoder.dispatchThreads(transThreadsPerGrid, threadsPerThreadgroup: transThreadsPerTG)
+        let transXThreadsPerGrid = MTLSize(width: Int(x_cols), height: Int(x_rows), depth: 1)
+        encoder.dispatchThreads(transXThreadsPerGrid, threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         
         // 2. Calculate Weight Gradient: dW = X^T * dY
-        // X^T is [inputDim x batchSize], dY is [batchSize x outputDim]
         let gemmPSO = engine.getPipelineState(name: "gemm_kernel")
         encoder.setComputePipelineState(gemmPSO)
         encoder.setBuffer(transposedInput.buffer, offset: 0, index: 0)
@@ -152,18 +177,47 @@ public class LinearLayer {
         encoder.setBytes(&K_dW, length: MemoryLayout<UInt32>.size, index: 4)
         encoder.setBytes(&N_dW, length: MemoryLayout<UInt32>.size, index: 5)
         
-        let dWThreadsPerGrid = MTLSize(width: Int(N_dW), height: Int(M_dW), depth: 1)
-        encoder.dispatchThreads(dWThreadsPerGrid, threadsPerThreadgroup: transThreadsPerTG) // reusing TG size logic
+        encoder.dispatchThreads(MTLSize(width: Int(N_dW), height: Int(M_dW), depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         
         // 3. Calculate Bias Gradient: db = sum(dY) over batch
-        // For simplicity, we'll assume a single row addition for now (no full reduction kernel yet)
-        // In a real framework, we'd use a reduction. Here we'll just copy the first row of dY as a proxy 
-        // OR better, we'll implement a simple sum-over-batch for bias. 
-        // For Goal #3, let's keep it simple: db stores the accumulated gradients.
-        // We'll just take the gradient of the first sample for bias to stay within scope of 3 kernels.
-        // Actually, let's just use the first row of upstreamGradient as db.
-        let biasPSO = engine.getPipelineState(name: "bias_add_kernel") // We can use bias_add with negative lr later
-        // Skip db calculate for a second, let's just do weights for the milestone.
+        let sumPSO = engine.getPipelineState(name: "sum_rows_kernel")
+        encoder.setComputePipelineState(sumPSO)
+        encoder.setBuffer(upstreamGradient.buffer, offset: 0, index: 0)
+        encoder.setBuffer(biasGradients.buffer, offset: 0, index: 1)
+        var s_rows = UInt32(upstreamGradient.rows)
+        var s_cols = UInt32(upstreamGradient.cols)
+        encoder.setBytes(&s_rows, length: MemoryLayout<UInt32>.size, index: 2)
+        encoder.setBytes(&s_cols, length: MemoryLayout<UInt32>.size, index: 3)
+        
+        let sumThreadsPerGrid = MTLSize(width: Int(s_cols), height: 1, depth: 1)
+        encoder.dispatchThreads(sumThreadsPerGrid, threadsPerThreadgroup: MTLSize(width: min(sumPSO.maxTotalThreadsPerThreadgroup, Int(s_cols)), height: 1, depth: 1))
+        
+        // 4. Calculate Input Gradient: dX = dY * W^T
+        // A. Transpose Weights: W -> W^T [outputDim x inputDim]
+        encoder.setComputePipelineState(transPSO)
+        encoder.setBuffer(weights.buffer, offset: 0, index: 0)
+        encoder.setBuffer(transposedWeights.buffer, offset: 0, index: 1)
+        var w_rows = UInt32(weights.rows)
+        var w_cols = UInt32(weights.cols)
+        encoder.setBytes(&w_rows, length: MemoryLayout<UInt32>.size, index: 2)
+        encoder.setBytes(&w_cols, length: MemoryLayout<UInt32>.size, index: 3)
+        
+        let transWThreadsPerGrid = MTLSize(width: Int(w_cols), height: Int(w_rows), depth: 1)
+        encoder.dispatchThreads(transWThreadsPerGrid, threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        
+        // B. dX = dY * W^T
+        encoder.setComputePipelineState(gemmPSO)
+        encoder.setBuffer(upstreamGradient.buffer, offset: 0, index: 0)
+        encoder.setBuffer(transposedWeights.buffer, offset: 0, index: 1)
+        encoder.setBuffer(inputGradients.buffer, offset: 0, index: 2)
+        var M_dX = UInt32(upstreamGradient.rows)
+        var K_dX = UInt32(upstreamGradient.cols)
+        var N_dX = UInt32(transposedWeights.cols)
+        encoder.setBytes(&M_dX, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&K_dX, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&N_dX, length: MemoryLayout<UInt32>.size, index: 5)
+        
+        encoder.dispatchThreads(MTLSize(width: Int(N_dX), height: Int(M_dX), depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         
         // 4. SGD Update: W = W - lr * dW
         let updatePSO = engine.getPipelineState(name: "sgd_update_kernel")
@@ -175,12 +229,22 @@ public class LinearLayer {
         var wLength = UInt32(weights.rows * weights.cols)
         encoder.setBytes(&wLength, length: MemoryLayout<UInt32>.size, index: 3)
         
-        let updateThreadsPerGrid = MTLSize(width: Int(wLength), height: 1, depth: 1)
-        let updateThreadsPerTG = MTLSize(width: min(updatePSO.maxTotalThreadsPerThreadgroup, Int(wLength)), height: 1, depth: 1)
-        encoder.dispatchThreads(updateThreadsPerGrid, threadsPerThreadgroup: updateThreadsPerTG)
+        encoder.dispatchThreads(MTLSize(width: Int(wLength), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        
+        // B. Update Biases: b = b - lr * db
+        encoder.setComputePipelineState(updatePSO)
+        encoder.setBuffer(bias.buffer, offset: 0, index: 0)
+        encoder.setBuffer(biasGradients.buffer, offset: 0, index: 1)
+        encoder.setBytes(&lr, length: MemoryLayout<Float>.size, index: 2)
+        var bLength = UInt32(bias.rows * bias.cols)
+        encoder.setBytes(&bLength, length: MemoryLayout<UInt32>.size, index: 3)
+        
+        encoder.dispatchThreads(MTLSize(width: Int(bLength), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(updatePSO.maxTotalThreadsPerThreadgroup, Int(bLength)), height: 1, depth: 1))
         
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        
+        return inputGradients
     }
 }

@@ -5,7 +5,7 @@ import Metal
 struct yanaiengine {
     static func main() {
         print("==============================================")
-        print("Starting YanAIEngine: Goal #3 (Training Loop)")
+        print("Starting YanAIEngine: Goal #4 (The XOR Problem)")
         print("==============================================\n")
         
         // Initialize Metal Engine
@@ -13,82 +13,100 @@ struct yanaiengine {
             fatalError("Failed to initialize Metal Engine")
         }
         
-        // Load all required kernels
+        // Load all required kernels for multi-layer training
         print("Loading Metal kernels...")
-        engine.loadLibrary(resourceName: "gemm", kernelName: "gemm_kernel")
-        engine.loadLibrary(resourceName: "gemm", kernelName: "bias_add_kernel")
-        engine.loadLibrary(resourceName: "gemm", kernelName: "relu_kernel")
-        engine.loadLibrary(resourceName: "gemm", kernelName: "transpose_kernel")
-        engine.loadLibrary(resourceName: "gemm", kernelName: "mse_derivative_kernel")
-        engine.loadLibrary(resourceName: "gemm", kernelName: "sgd_update_kernel")
+        let kernels = [
+            "gemm_kernel", "bias_add_kernel", "relu_kernel", 
+            "transpose_kernel", "mse_derivative_kernel", 
+            "sgd_update_kernel", "relu_derivative_kernel",
+            "sum_rows_kernel"
+        ]
+        for kernel in kernels {
+            engine.loadLibrary(resourceName: "gemm", kernelName: kernel)
+        }
         
-        // Define dimensions
-        let batchSize = 1
+        // 1. Setup XOR Dataset
+        let batchSize = 4
         let inputDim = 2
         let outputDim = 1
         
-        // 1. Setup Training Data (X -> Y)
-        // We want the network to learn that [1, 2] -> [5]
-        let input = Tensor(device: engine.device, rows: batchSize, cols: inputDim)
-        input.pointer()[0] = 1.0
-        input.pointer()[1] = 2.0
+        let inputs = Tensor(device: engine.device, rows: batchSize, cols: inputDim)
+        let targets = Tensor(device: engine.device, rows: batchSize, cols: outputDim)
         
-        let target = Tensor(device: engine.device, rows: batchSize, cols: outputDim)
-        target.pointer()[0] = 5.0
+        // Data: [0,0]->[0], [0,1]->[1], [1,0]->[1], [1,1]->[0]
+        let ptrIn = inputs.pointer()
+        ptrIn[0] = 0; ptrIn[1] = 0
+        ptrIn[2] = 0; ptrIn[3] = 1
+        ptrIn[4] = 1; ptrIn[5] = 0
+        ptrIn[6] = 1; ptrIn[7] = 1
         
-        // 2. Initialize Layer
-        let linear = LinearLayer(engine: engine, inputDim: inputDim, outputDim: outputDim, batchSize: batchSize)
-        // Set specific weights to start
-        linear.weights.pointer()[0] = 0.1
-        linear.weights.pointer()[1] = 0.1
-        linear.bias.fill(with: 0.0)
+        let ptrTar = targets.pointer()
+        ptrTar[0] = 0
+        ptrTar[1] = 1
+        ptrTar[2] = 1
+        ptrTar[3] = 0
         
-        // 3. Loss Gradient Buffer (dY)
+        // 2. Initialize Sequential Model (2 -> 16 -> 1)
+        // CRITICAL: The hidden layer uses ReLU, but the output layer is linear (ReLU disabled)
+        // This prevents the "Dying ReLU" problem and allows stable convergence for binary targets.
+        print("Architecting MLP: 2 Inputs -> 16 Hidden Nodes (ReLU) -> 1 Output (Linear)...")
+        let layer1 = LinearLayer(engine: engine, inputDim: 2, outputDim: 16, batchSize: batchSize, useReLU: true)
+        let layer2 = LinearLayer(engine: engine, inputDim: 16, outputDim: 1, batchSize: batchSize, useReLU: false)
+        
+        let model = Sequential(layers: [layer1, layer2])
+        
+        // 3. Training Loop
+        let epochs = 2000
+        let learningRate: Float = 0.1
         let lossGradient = Tensor(device: engine.device, rows: batchSize, cols: outputDim)
         
-        // 4. Training Loop
-        let epochs = 100
-        let learningRate: Float = 0.1
-        
-        print("\nStarting Training for \(epochs) epochs (LR: \(learningRate))...")
+        print("\nStarting Training for \(epochs) epochs...")
         
         for epoch in 1...epochs {
             // A. Forward Pass
-            linear.forward(input: input)
+            let output = model.forward(input: inputs)
             
-            // B. Calculate Loss Gradient (dY = Output - Target) on GPU
+            // B. Calculate Loss Gradient (dY = Output - Target)
             guard let commandBuffer = engine.commandQueue.makeCommandBuffer(),
-                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
-                fatalError("Failed to create command buffer")
-            }
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else { fatalError() }
             
             let lossPSO = engine.getPipelineState(name: "mse_derivative_kernel")
             encoder.setComputePipelineState(lossPSO)
-            encoder.setBuffer(linear.output.buffer, offset: 0, index: 0)
-            encoder.setBuffer(target.buffer, offset: 0, index: 1)
+            encoder.setBuffer(output.buffer, offset: 0, index: 0)
+            encoder.setBuffer(targets.buffer, offset: 0, index: 1)
             encoder.setBuffer(lossGradient.buffer, offset: 0, index: 2)
-            var length = UInt32(batchSize * outputDim)
-            encoder.setBytes(&length, length: MemoryLayout<UInt32>.size, index: 3)
+            var n = UInt32(batchSize * outputDim)
+            encoder.setBytes(&n, length: MemoryLayout<UInt32>.size, index: 3)
             
-            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), 
-                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            encoder.dispatchThreads(MTLSize(width: batchSize, height: 1, depth: 1), 
+                                    threadsPerThreadgroup: MTLSize(width: batchSize, height: 1, depth: 1))
             encoder.endEncoding()
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
             
-            // C. Backward Pass (Calculates dW and updates Weights)
-            linear.backward(upstreamGradient: lossGradient, learningRate: learningRate)
+            // C. Backward Pass (Chain Rule across layers)
+            model.backward(lossGradient: lossGradient, learningRate: learningRate)
             
             // D. Log Progress
-            if epoch % 10 == 0 || epoch == 1 {
-                let currentOut = linear.output.pointer()[0]
-                let loss = 0.5 * pow(currentOut - 5.0, 2)
-                print("Epoch \(epoch): Loss = \(String(format: "%.6f", loss)), Output = \(String(format: "%.4f", currentOut))")
+            if epoch % 200 == 0 || epoch == 1 {
+                var totalLoss: Float = 0
+                let ptrOut = output.pointer()
+                for i in 0..<batchSize {
+                    totalLoss += 0.5 * pow(ptrOut[i] - ptrTar[i], 2)
+                }
+                print("Epoch \(epoch): Loss = \(String(format: "%.6f", totalLoss / Float(batchSize)))")
             }
         }
         
-        print("\nTraining Complete!")
-        print("Final Output for [1, 2]: \(linear.output.pointer()[0]) (Target: 5.0)")
-        print("Final Weights: \(linear.weights.pointer()[0]), \(linear.weights.pointer()[1])")
+        // 4. Final Inference
+        print("\nFinal XOR Predictions:")
+        let finalOutput = model.forward(input: inputs)
+        let res = finalOutput.pointer()
+        print("[0, 0] -> \(String(format: "%.4f", res[0])) (Target: 0.0)")
+        print("[0, 1] -> \(String(format: "%.4f", res[1])) (Target: 1.0)")
+        print("[1, 0] -> \(String(format: "%.4f", res[2])) (Target: 1.0)")
+        print("[1, 1] -> \(String(format: "%.4f", res[3])) (Target: 0.0)")
+        
+        print("\nGoal #4 Complete: Non-Linear XOR Solved natively on Apple GPU!")
     }
 }

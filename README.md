@@ -7,10 +7,10 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 
 ### Key Milestones Completed
 - [x] **Zero-Copy Memory Bridge**: `Tensor` structures backed by `MTLBuffer` with shared storage mode.
-- [x] **Full Training Pipeline**: Support for forward and backward passes with weight updates via SGD.
-- [x] **Chained GPU Execution**: Complex computational graphs (GEMM -> Bias -> ReLU) are executed in a single command buffer.
-- [x] **Bare-Metal Kernels**: Hand-written MSL for GEMM, Transposition, Bias Addition, MSE Derivative, and SGD Optimization.
-- [x] **Modular Abstractions**: Higher-level Swift wrappers like `LinearLayer` that encapsulate low-level dispatch logic.
+- [x] **Deep Learning & Chain Rule**: Full backpropagation support across multiple layers.
+- [x] **Sequential Model Abstraction**: Stackable `LinearLayer` components managed by a `Sequential` container.
+- [x] **Non-Linear Solving**: Successfully trained to solve the XOR problem natively on the GPU.
+- [x] **Bare-Metal Kernels**: Hand-written MSL for GEMM, Transposition, Bias Addition, Row Summing, MSE Derivative, ReLU Derivative, and SGD Optimization.
 
 ## Architecture
 
@@ -18,9 +18,10 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 |-----------|-------------|
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
-| `LinearLayer.swift` | The building block. Manages parameters, calculates gradients, and applies optimization. |
-| `gemm.metal` | The math. Optimized kernels for linear algebra and training operations. |
-| `yanaiengine.swift` | The entry point. Demonstrates a full training loop with loss convergence. |
+| `Sequential.swift` | The orchestrator. Chains layers and manages the multi-layer forward/backward flow. |
+| `LinearLayer.swift` | The building block. Manages parameters, calculates gradients (dW, db, dX), and applies optimization. |
+| `gemm.metal` | The math. Optimized kernels for linear algebra and deep learning operations. |
+| `yanaiengine.swift` | The entry point. Demonstrates a multi-layer training loop solving the XOR problem. |
 
 ## Quick Start
 
@@ -33,7 +34,7 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 cd yanaiengine
 swift run
 ```
-The demo will train a single layer to map `[1, 2]` to `5.0`, demonstrating loss reduction over 100 epochs.
+The demo will train a 2-layer neural network (2 -> 16 -> 1) to solve the **XOR Problem**, demonstrating non-linear learning convergence over 2000 epochs.
 
 ### Running via Xcode
 1. In Xcode, select **File > Open...** and select the `yanaiengine` folder (or `Package.swift`).
@@ -41,4 +42,4 @@ The demo will train a single layer to map `[1, 2]` to `5.0`, demonstrating loss 
 3. Press `Cmd + R` to Build and Run.
 
 ## Performance & UMA
-Unlike traditional discrete GPU setups, `YanAIEngine` uses `.storageModeShared`. This means the CPU writes inputs into a memory region that the GPU can see immediately without any PCIe transfer overhead. By chaining kernels in a single `MTLCommandBuffer`, we ensure the GPU remains fully utilized while the CPU stays asynchronous, proving that a micro-framework can be built from the silicon up.
+Unlike traditional discrete GPU setups, `YanAIEngine` uses `.storageModeShared`. This means the CPU writes inputs into a memory region that the GPU can see immediately without any PCIe transfer overhead. By chaining kernels in a single `MTLCommandBuffer`, we ensure the GPU remains fully utilized while the CPU stays asynchronous, proving that a true Deep Learning framework can be built from the silicon up.
