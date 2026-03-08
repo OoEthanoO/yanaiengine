@@ -277,3 +277,53 @@ kernel void elementwise_add_kernel(
     if (gid >= length) return;
     output[gid] = a[gid] + b[gid];
 }
+
+// Rotary Positional Embedding (RoPE): rotates Q/K pairs by position-dependent angles.
+// One thread per (position, dimension_pair).
+// data layout: [seqLen x dHead], each thread handles one pair (2i, 2i+1).
+kernel void rope_kernel(
+    device float* data [[buffer(0)]],
+    constant uint& seqLen [[buffer(1)]],
+    constant uint& dHead [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]  // x = pair_index, y = position
+) {
+    uint pos = gid.y;
+    uint pair = gid.x;
+    uint numPairs = dHead / 2;
+    
+    if (pos >= seqLen || pair >= numPairs) return;
+    
+    // θ_i = pos / 10000^(2i / dHead)
+    float theta = float(pos) / pow(10000.0, float(2 * pair) / float(dHead));
+    float cos_theta = cos(theta);
+    float sin_theta = sin(theta);
+    
+    uint idx0 = pos * dHead + 2 * pair;
+    uint idx1 = idx0 + 1;
+    
+    float x0 = data[idx0];
+    float x1 = data[idx1];
+    
+    data[idx0] = x0 * cos_theta - x1 * sin_theta;
+    data[idx1] = x0 * sin_theta + x1 * cos_theta;
+}
+
+// Embedding Lookup: copies rows from weight matrix based on token IDs.
+// output[i] = weights[tokenIds[i]]  (i.e., row tokenIds[i] of weight matrix)
+// One thread per (token_index, dimension).
+kernel void embedding_lookup_kernel(
+    device const uint* tokenIds [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& seqLen [[buffer(3)]],
+    constant uint& dModel [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]  // x = dim, y = token_index
+) {
+    uint tokenIdx = gid.y;
+    uint dim = gid.x;
+    
+    if (tokenIdx >= seqLen || dim >= dModel) return;
+    
+    uint tokenId = tokenIds[tokenIdx];
+    output[tokenIdx * dModel + dim] = weights[tokenId * dModel + dim];
+}

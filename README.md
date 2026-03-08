@@ -13,7 +13,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #5: Distributed Interconnect**: Multi-node synchronization via **SwiftNIO** with All-Reduce gradient averaging.
 - [x] **Goal #6: Transformer Attention**: Scaled Dot-Product Self-Attention with Softmax, Scaling, and Causal Masking.
 - [x] **Goal #7: Full Transformer Block**: Multi-Head Attention, LayerNorm, GELU, Residual Connections — the exact architecture of GPT/Llama.
-- [x] **Bare-Metal Kernels**: 14 hand-written MSL kernels: GEMM, Transpose, Softmax, Scale, Causal Mask, GELU, LayerNorm, Element-wise Add, and more.
+- [x] **Goal #8: RoPE & Autoregressive Generation**: Rotary Positional Embeddings, Embedding/LMHead layers, and token-by-token text generation.
+- [x] **Bare-Metal Kernels**: 16 hand-written MSL kernels: GEMM, RoPE, Softmax, GELU, LayerNorm, Embedding Lookup, and more.
 
 ## Architecture
 
@@ -21,14 +22,16 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 |-----------|-------------|
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
-| `TransformerBlock.swift` | The LLM core. Pre-Norm architecture with MHA, FFN(GELU), LayerNorm, and Residual Connections. |
-| `MultiHeadAttention.swift` | Parallelized attention. Splits Q/K/V into h heads with batched computation. |
+| `TransformerBlock.swift` | The LLM core. Pre-Norm with MHA, FFN(GELU), LayerNorm, Residual Connections. |
+| `MultiHeadAttention.swift` | Parallelized attention with **RoPE** positional encoding. |
+| `EmbeddingLayer.swift` | Token ID → dense vector lookup via GPU kernel. |
+| `LMHead.swift` | Final projection to vocabulary logits with greedy argmax decoding. |
 | `SelfAttention.swift` | Single-head attention. Q/K/V projections and Scaled Dot-Product Attention. |
 | `Interconnect.swift` | The network layer. Asynchronous TCP bridge using **SwiftNIO**. |
 | `Sequential.swift` | The orchestrator. Chains layers for multi-layer forward/backward flow. |
 | `LinearLayer.swift` | The building block. Manages parameters, gradients, and SGD optimization. |
-| `gemm.metal` | The math. 14 kernels: GEMM, Transpose, Softmax, Scale, GELU, LayerNorm, and more. |
-| `yanaiengine.swift` | The entry point. Demos a full TransformerBlock with MHA verification. |
+| `gemm.metal` | The math. 16 kernels: GEMM, RoPE, Softmax, GELU, LayerNorm, Embedding, and more. |
+| `yanaiengine.swift` | The entry point. Autoregressive text generation with full LLM pipeline. |
 
 ## Quick Start
 
@@ -36,12 +39,12 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - A Mac with **Apple Silicon** (M1, M2, M3 series).
 - **Xcode 15+** or the **Swift 6.0+** toolchain.
 
-### Running the Transformer Block Demo
+### Running the LLM Generation Demo
 ```bash
 cd yanaiengine
 swift run
 ```
-Runs a 4-token sequence through a full **Transformer Block** (LayerNorm → Multi-Head Attention → Residual → LayerNorm → FFN(GELU) → Residual), verifying shape preservation, transformation, and numerical stability.
+Generates text token-by-token using the full LLM pipeline: **Embedding → RoPE → Multi-Head Attention → LayerNorm → FFN(GELU) → LMHead → argmax**. Starts from a seed token and autoregressively predicts the next token at each step.
 
 ### Running via Xcode
 1. In Xcode, select **File > Open...** and select the `yanaiengine` folder (or `Package.swift`).

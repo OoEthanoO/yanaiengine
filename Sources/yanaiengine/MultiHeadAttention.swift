@@ -88,6 +88,28 @@ public class MultiHeadAttention {
             guard let commandBuffer = engine.commandQueue.makeCommandBuffer(),
                   let encoder = commandBuffer.makeComputeCommandEncoder() else { fatalError() }
             
+            // Apply RoPE to Q_h and K_h
+            let ropePSO = engine.getPipelineState(name: "rope_kernel")
+            var ropeSeq = UInt32(seqLen)
+            var ropeDHead = UInt32(dHead)
+            let numPairs = dHead / 2
+            
+            // RoPE on Q_h
+            encoder.setComputePipelineState(ropePSO)
+            encoder.setBuffer(qhBuffer.buffer, offset: 0, index: 0)
+            encoder.setBytes(&ropeSeq, length: MemoryLayout<UInt32>.size, index: 1)
+            encoder.setBytes(&ropeDHead, length: MemoryLayout<UInt32>.size, index: 2)
+            encoder.dispatchThreads(MTLSize(width: numPairs, height: seqLen, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+            
+            // RoPE on K_h
+            encoder.setComputePipelineState(ropePSO)
+            encoder.setBuffer(khBuffer.buffer, offset: 0, index: 0)
+            encoder.setBytes(&ropeSeq, length: MemoryLayout<UInt32>.size, index: 1)
+            encoder.setBytes(&ropeDHead, length: MemoryLayout<UInt32>.size, index: 2)
+            encoder.dispatchThreads(MTLSize(width: numPairs, height: seqLen, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+            
             // Transpose K_h -> [dHead x seqLen]
             let transPSO = engine.getPipelineState(name: "transpose_kernel")
             encoder.setComputePipelineState(transPSO)

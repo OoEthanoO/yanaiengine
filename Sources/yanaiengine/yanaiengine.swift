@@ -5,7 +5,8 @@ import Metal
 struct yanaiengine {
     static func main() {
         print("==============================================")
-        print("  YanAIEngine: Goal #7 — Transformer Block")
+        print("  YanAIEngine: Goal #8 — LLM Generation")
+        print("  RoPE + Embedding + TransformerBlock + LMHead")
         print("==============================================\n")
         
         guard let engine = MetalEngine() else { fatalError("Metal not available") }
@@ -16,81 +17,129 @@ struct yanaiengine {
             "transpose_kernel", "mse_derivative_kernel", "sgd_update_kernel",
             "relu_derivative_kernel", "sum_rows_kernel",
             "softmax_kernel", "scale_kernel", "causal_mask_kernel",
-            // New for Goal #7:
-            "gelu_kernel", "layernorm_kernel", "elementwise_add_kernel"
+            "gelu_kernel", "layernorm_kernel", "elementwise_add_kernel",
+            // New for Goal #8:
+            "rope_kernel", "embedding_lookup_kernel"
         ]
         for kernel in kernels {
             engine.loadLibrary(resourceName: "gemm", kernelName: kernel)
         }
         
-        // Configuration
-        let seqLen = 4     // 4 tokens
-        let dModel = 8     // 8-dim embeddings
-        let numHeads = 2   // 2 attention heads (dHead = 4)
+        // ---- Vocabulary ----
+        let vocab: [String] = [
+            "the",      // 0
+            "AI",       // 1
+            "engine",   // 2
+            "runs",     // 3
+            "on",       // 4
+            "silicon",  // 5
+            "metal",    // 6
+            "gpu",      // 7
+            "fast",     // 8
+            "now"       // 9
+        ]
+        let vocabSize = vocab.count
+        
+        // ---- Configuration ----
+        let maxSeqLen = 8    // Max tokens in generated sequence
+        let dModel = 8       // Embedding dimension
+        let numHeads = 2     // Attention heads (dHead = 4)
         
         print("Configuration:")
-        print("  Sequence Length:  \(seqLen)")
-        print("  Model Dimension:  \(dModel)")
-        print("  Attention Heads:  \(numHeads) (dHead = \(dModel / numHeads))")
-        print("  FFN Expansion:    4x (\(dModel) → \(4 * dModel) → \(dModel))")
-        print("  Causal Mask:      ON")
-        print("  Activation:       GELU\n")
+        print("  Vocabulary:    \(vocab)")
+        print("  Vocab Size:    \(vocabSize)")
+        print("  Max Seq Len:   \(maxSeqLen)")
+        print("  dModel:        \(dModel)")
+        print("  Heads:         \(numHeads) (dHead = \(dModel / numHeads))")
+        print("  Positional:    RoPE (Rotary)")
+        print("  Decoding:      Greedy (argmax)\n")
         
-        // Create input: [seqLen x dModel]
-        let input = Tensor(device: engine.device, rows: seqLen, cols: dModel)
-        let ptr = input.pointer()
-        for i in 0..<(seqLen * dModel) {
-            ptr[i] = Float(i) * 0.1
+        // ---- Build the LLM Pipeline ----
+        let embedding = EmbeddingLayer(engine: engine, vocabSize: vocabSize, dModel: dModel, maxSeqLen: maxSeqLen)
+        let transformer = TransformerBlock(engine: engine, seqLen: maxSeqLen, dModel: dModel, numHeads: numHeads)
+        let lmHead = LMHead(engine: engine, dModel: dModel, vocabSize: vocabSize, maxSeqLen: maxSeqLen)
+        
+        print("LLM Pipeline: Embedding → TransformerBlock(RoPE) → LMHead → argmax\n")
+        
+        // ---- Autoregressive Generation ----
+        let startToken: UInt32 = 0  // "the"
+        var sequence: [UInt32] = [startToken]
+        let tokensToGenerate = maxSeqLen - 1  // Generate 7 more tokens
+        
+        print("Starting generation from: \"\(vocab[Int(startToken)])\"")
+        print("Generating \(tokensToGenerate) tokens...\n")
+        
+        for step in 0..<tokensToGenerate {
+            let currentLen = sequence.count
+            
+            // 1. Embed: token IDs → dense vectors [currentLen x dModel]
+            embedding.forward(tokenIds: sequence)
+            
+            // 2. Create a properly-sized input for the transformer
+            //    Copy only the current sequence into a [maxSeqLen x dModel] tensor
+            //    (pad remaining positions with zeros)
+            let transformerInput = Tensor(device: engine.device, rows: maxSeqLen, cols: dModel)
+            let srcPtr = embedding.output.pointer()
+            let dstPtr = transformerInput.pointer()
+            for i in 0..<(currentLen * dModel) {
+                dstPtr[i] = srcPtr[i]
+            }
+            
+            // 3. Transformer Block (with RoPE inside MHA)
+            transformer.forward(input: transformerInput)
+            
+            // 4. LM Head: project to vocab logits
+            lmHead.forward(input: transformer.output)
+            
+            // 5. Greedy decode: argmax of last token's logits
+            let nextToken = lmHead.argmaxLastToken(seqLen: currentLen)
+            sequence.append(nextToken)
+            
+            // Print progress
+            let tokenStr = vocab[Int(nextToken)]
+            let seqStr = sequence.map { vocab[Int($0)] }.joined(separator: " ")
+            print("  Step \(step + 1): predicted \"\(tokenStr)\" → [\(seqStr)]")
         }
         
-        print("Input Embeddings (\(seqLen) tokens × \(dModel) dims):")
-        input.printMatrix()
+        // ---- Final Output ----
+        let finalText = sequence.map { vocab[Int($0)] }.joined(separator: " ")
         
-        // Create and run TransformerBlock
-        let block = TransformerBlock(engine: engine, seqLen: seqLen, dModel: dModel, numHeads: numHeads)
-        
-        print("Running Full Transformer Block on GPU...")
-        print("  Pipeline: LayerNorm → MHA(2 heads) → Residual → LayerNorm → FFN(GELU) → Residual\n")
-        block.forward(input: input)
+        print("\n==============================================")
+        print("  Generated Text")
+        print("==============================================")
+        print("  \"\(finalText)\"")
+        print("==============================================\n")
         
         // ---- Verification ----
-        print("--- Transformer Block Output (\(seqLen) tokens × \(dModel) dims) ---")
-        block.output.printMatrix()
-        
-        // Check 1: Output shape matches input shape (residual preserves dimensions)
-        let shapeMatch = (block.output.rows == seqLen && block.output.cols == dModel)
-        
-        // Check 2: Output is not identical to input (transformation happened)
-        var isTransformed = false
-        let outPtr = block.output.pointer()
-        for i in 0..<(seqLen * dModel) {
-            if abs(outPtr[i] - ptr[i]) > 1e-6 {
-                isTransformed = true
-                break
+        let allValid = sequence.allSatisfy { $0 < UInt32(vocabSize) }
+        let correctLength = sequence.count == maxSeqLen
+        let isDeterministic: Bool = {
+            // Run a second pass with the same start token to verify determinism
+            var seq2: [UInt32] = [startToken]
+            for _ in 0..<tokensToGenerate {
+                embedding.forward(tokenIds: seq2)
+                let tInput = Tensor(device: engine.device, rows: maxSeqLen, cols: dModel)
+                let s = embedding.output.pointer()
+                let d = tInput.pointer()
+                for i in 0..<(seq2.count * dModel) { d[i] = s[i] }
+                transformer.forward(input: tInput)
+                lmHead.forward(input: transformer.output)
+                seq2.append(lmHead.argmaxLastToken(seqLen: seq2.count))
             }
-        }
+            return seq2 == sequence
+        }()
         
-        // Check 3: Output contains valid numbers (no NaN/Inf)
-        var allFinite = true
-        for i in 0..<(seqLen * dModel) {
-            if outPtr[i].isNaN || outPtr[i].isInfinite {
-                allFinite = false
-                break
-            }
-        }
-        
-        print("==============================================")
         print("  Verification Results")
         print("==============================================")
-        print("  Shape preserved (residual):  \(shapeMatch ? "✅ PASS" : "❌ FAIL")  [\(block.output.rows)×\(block.output.cols)]")
-        print("  Transformation applied:      \(isTransformed ? "✅ PASS" : "❌ FAIL")")
-        print("  All values finite:           \(allFinite ? "✅ PASS" : "❌ FAIL")")
+        print("  All tokens valid IDs:     \(allValid ? "✅ PASS" : "❌ FAIL")")
+        print("  Sequence length correct:  \(correctLength ? "✅ PASS" : "❌ FAIL")  [\(sequence.count)/\(maxSeqLen)]")
+        print("  Deterministic output:     \(isDeterministic ? "✅ PASS" : "❌ FAIL")")
         print("==============================================")
         
-        if shapeMatch && isTransformed && allFinite {
-            print("\n🚀 Goal #7 COMPLETE: Full Transformer Block running on Apple Silicon!")
-            print("   Architecture: Pre-Norm with Multi-Head Attention + FFN(GELU)")
-            print("   This is the exact micro-architecture of GPT, Llama, and Claude.")
+        if allValid && correctLength && isDeterministic {
+            print("\n🚀 Goal #8 COMPLETE: Autoregressive LLM generation on Apple Silicon!")
+            print("   Pipeline: Embedding → RoPE → MHA → LayerNorm → FFN(GELU) → LMHead → argmax")
+            print("   Your engine can now generate text, one token at a time.")
         }
     }
 }
