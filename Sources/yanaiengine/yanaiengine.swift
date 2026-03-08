@@ -5,7 +5,7 @@ import Metal
 struct yanaiengine {
     static func main() {
         print("==============================================")
-        print("Starting YanAIEngine: Goal #2 (Forward Pass)")
+        print("Starting YanAIEngine: Goal #3 (Training Loop)")
         print("==============================================\n")
         
         // Initialize Metal Engine
@@ -13,68 +13,82 @@ struct yanaiengine {
             fatalError("Failed to initialize Metal Engine")
         }
         
-        // Load all required kernels for Goal #2
+        // Load all required kernels
         print("Loading Metal kernels...")
         engine.loadLibrary(resourceName: "gemm", kernelName: "gemm_kernel")
         engine.loadLibrary(resourceName: "gemm", kernelName: "bias_add_kernel")
         engine.loadLibrary(resourceName: "gemm", kernelName: "relu_kernel")
+        engine.loadLibrary(resourceName: "gemm", kernelName: "transpose_kernel")
+        engine.loadLibrary(resourceName: "gemm", kernelName: "mse_derivative_kernel")
+        engine.loadLibrary(resourceName: "gemm", kernelName: "sgd_update_kernel")
         
         // Define dimensions
-        let batchSize = 2
-        let inputDim = 3
-        let outputDim = 2
+        let batchSize = 1
+        let inputDim = 2
+        let outputDim = 1
         
-        // 1. Setup Input Tensor
-        print("\nPreparing input tensor labels...")
+        // 1. Setup Training Data (X -> Y)
+        // We want the network to learn that [1, 2] -> [5]
         let input = Tensor(device: engine.device, rows: batchSize, cols: inputDim)
-        let ptrIn = input.pointer()
-        // Input: [ [1, 2, 3], [-4, -5, -6] ]
-        ptrIn[0] = 1; ptrIn[1] = 2; ptrIn[2] = 3
-        ptrIn[3] = -4; ptrIn[4] = -5; ptrIn[5] = -6
+        input.pointer()[0] = 1.0
+        input.pointer()[1] = 2.0
         
-        print("Input Tensor (2x3):")
-        input.printMatrix()
+        let target = Tensor(device: engine.device, rows: batchSize, cols: outputDim)
+        target.pointer()[0] = 5.0
         
-        // 2. Initialize Linear Layer
-        print("Initializing Linear Layer (Weights: 3x2, Bias: 1x2)...")
+        // 2. Initialize Layer
         let linear = LinearLayer(engine: engine, inputDim: inputDim, outputDim: outputDim, batchSize: batchSize)
+        // Set specific weights to start
+        linear.weights.pointer()[0] = 0.1
+        linear.weights.pointer()[1] = 0.1
+        linear.bias.fill(with: 0.0)
         
-        // Set deterministic weights for verification
-        // Weight matrix: [ [0.5, -0.5], [1.0, -1.0], [1.5, -1.5] ]
-        let ptrW = linear.weights.pointer()
-        ptrW[0] = 0.5; ptrW[1] = -0.5
-        ptrW[2] = 1.0; ptrW[3] = -1.0
-        ptrW[4] = 1.5; ptrW[5] = -1.5
+        // 3. Loss Gradient Buffer (dY)
+        let lossGradient = Tensor(device: engine.device, rows: batchSize, cols: outputDim)
         
-        // Set deterministic bias: [ 0.1, 0.1 ]
-        let ptrB = linear.bias.pointer()
-        ptrB[0] = 0.1; ptrB[1] = 0.1
+        // 4. Training Loop
+        let epochs = 100
+        let learningRate: Float = 0.1
         
-        print("Weights (3x2):")
-        linear.weights.printMatrix()
-        print("Bias (1x2):")
-        linear.bias.printMatrix()
+        print("\nStarting Training for \(epochs) epochs (LR: \(learningRate))...")
         
-        // 3. Execute Forward Pass (Chained on GPU)
-        print("Executing Forward Pass: ReLU(X * W + b)...")
-        linear.forward(input: input)
+        for epoch in 1...epochs {
+            // A. Forward Pass
+            linear.forward(input: input)
+            
+            // B. Calculate Loss Gradient (dY = Output - Target) on GPU
+            guard let commandBuffer = engine.commandQueue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                fatalError("Failed to create command buffer")
+            }
+            
+            let lossPSO = engine.getPipelineState(name: "mse_derivative_kernel")
+            encoder.setComputePipelineState(lossPSO)
+            encoder.setBuffer(linear.output.buffer, offset: 0, index: 0)
+            encoder.setBuffer(target.buffer, offset: 0, index: 1)
+            encoder.setBuffer(lossGradient.buffer, offset: 0, index: 2)
+            var length = UInt32(batchSize * outputDim)
+            encoder.setBytes(&length, length: MemoryLayout<UInt32>.size, index: 3)
+            
+            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), 
+                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            
+            // C. Backward Pass (Calculates dW and updates Weights)
+            linear.backward(upstreamGradient: lossGradient, learningRate: learningRate)
+            
+            // D. Log Progress
+            if epoch % 10 == 0 || epoch == 1 {
+                let currentOut = linear.output.pointer()[0]
+                let loss = 0.5 * pow(currentOut - 5.0, 2)
+                print("Epoch \(epoch): Loss = \(String(format: "%.6f", loss)), Output = \(String(format: "%.4f", currentOut))")
+            }
+        }
         
-        // 4. Verify Results
-        print("\nForward Pass Results (CPU Pointer):")
-        linear.output.printMatrix()
-        
-        // Math Verification:
-        // Row 1: [1, 2, 3] * [weights] = [ 1*0.5+2*1+3*1.5, 1*-0.5+2*-1+3*-1.5 ] = [ 0.5+2+4.5, -0.5-2-4.5 ] = [ 7, -7 ]
-        // Add Bias: [ 7+0.1, -7+0.1 ] = [ 7.1, -6.9 ]
-        // ReLU: [ 7.1, 0.0 ]
-        
-        // Row 2: [-4, -5, -6] * [weights] = [ -4*0.5-5*1-6*1.5, -4*-0.5-5*-1-6*-1.5 ] = [ -2-5-9, 2+5+9 ] = [ -16, 16 ]
-        // Add Bias: [ -16+0.1, 16+0.1 ] = [ -15.9, 16.1 ]
-        // ReLU: [ 0.0, 16.1 ]
-        
-        print("Expected Results:")
-        print("[7.1000, 0.0000]")
-        print("[0.0000, 16.1000]")
-        print("---")
+        print("\nTraining Complete!")
+        print("Final Output for [1, 2]: \(linear.output.pointer()[0]) (Target: 5.0)")
+        print("Final Weights: \(linear.weights.pointer()[0]), \(linear.weights.pointer()[1])")
     }
 }

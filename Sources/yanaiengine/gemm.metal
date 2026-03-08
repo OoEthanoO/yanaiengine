@@ -65,3 +65,49 @@ kernel void relu_kernel(
     float val = data[gid];
     data[gid] = val > 0.0 ? val : 0.0;
 }
+
+// Kernel to transpose a matrix: Output[col][row] = Input[row][col]
+kernel void transpose_kernel(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= cols || gid.y >= rows) {
+        return;
+    }
+    
+    // input is rows x cols, output is cols x rows
+    output[gid.x * rows + gid.y] = input[gid.y * cols + gid.x];
+}
+
+// Kernel to calculate the derivative of MSE loss: gradient = (output - target)
+kernel void mse_derivative_kernel(
+    device const float* output [[buffer(0)]],
+    device const float* target [[buffer(1)]],
+    device float* derivative [[buffer(2)]],
+    constant uint& length [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) {
+        return;
+    }
+    
+    derivative[gid] = output[gid] - target[gid];
+}
+
+// Kernel to update parameters using SGD: param = param - lr * gradient
+kernel void sgd_update_kernel(
+    device float* param [[buffer(0)]],
+    device const float* gradient [[buffer(1)]],
+    constant float& lr [[buffer(2)]],
+    constant uint& length [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) {
+        return;
+    }
+    
+    param[gid] -= lr * gradient[gid];
+}
