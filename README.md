@@ -7,17 +7,19 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 
 ### Key Milestones Completed
 - [x] **Zero-Copy Memory Bridge**: `Tensor` structures backed by `MTLBuffer` with shared storage mode.
-- [x] **Bare-Metal GEMM**: Hand-written Metal compute kernels for General Matrix Multiplication.
-- [x] **Integrated Swift Launcher**: A unified executable that handles GPU handshakes, threadgroup dispatching, and synchronization.
+- [x] **Chained Forward Pass**: Executing complex layers (Linear + ReLU) in a single GPU command buffer without CPU intervention.
+- [x] **Bare-Metal Kernels**: Hand-written MSL for GEMM, Bias Addition (broadcasting), and ReLU activation.
+- [x] **Modular Abstractions**: Higher-level Swift wrappers like `LinearLayer` that encapsulate low-level dispatch logic.
 
 ## Architecture
 
 | Component | Description |
 |-----------|-------------|
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory. |
-| `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and resilient shader loading. |
-| `gemm.metal` | The compute kernel. High-performance C++ based MSL for matrix math. |
-| `yanaiengine.swift` | The entry point. Coordinates the end-to-end pipeline. |
+| `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and caching multiple compute pipelines. |
+| `LinearLayer.swift` | The building block. Manages weights/biases and chains kernels for a complete forward pass. |
+| `gemm.metal` | The math. optimized kernels for GEMM, Bias Addition, and ReLU. |
+| `yanaiengine.swift` | The entry point. Demonstrates the computational graph execution. |
 
 ## Quick Start
 
@@ -37,4 +39,7 @@ swift run
 3. Press `Cmd + R` to Build and Run.
 
 ## Performance & UMA
-Unlike traditional discrete GPU setups, `YanAIEngine` uses `.storageModeShared`. This means the CPU writes the input matrices into a memory region that the GPU can see immediately without any PCIe transfer overhead. This "Engine Block" is the foundation for future layers, backpropagation, and distributed networking.
+Unlike traditional discrete GPU setups, `YanAIEngine` uses `.storageModeShared`. This means the CPU writes the input matrices into a memory region that the GPU can see immediately without any PCIe transfer overhead. By chaining kernels in a single `MTLCommandBuffer`, we ensure the GPU remains fully utilized while the CPU stays asynchronous.
+
+---
+*Part of the YanAIEngine Project.*
