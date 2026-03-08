@@ -5,85 +5,76 @@ import Metal
 struct yanaiengine {
     static func main() {
         print("==============================================")
-        print("Starting Native Swift-to-Metal GEMM Pipeline")
+        print("Starting YanAIEngine: Goal #2 (Forward Pass)")
         print("==============================================\n")
         
-        // Initialize Step 2/3/5: Metal Engine
+        // Initialize Metal Engine
         guard let engine = MetalEngine() else {
             fatalError("Failed to initialize Metal Engine")
         }
         
-        // Use the robust shader loader (works in Xcode and CLI)
+        // Load all required kernels for Goal #2
+        print("Loading Metal kernels...")
         engine.loadLibrary(resourceName: "gemm", kernelName: "gemm_kernel")
+        engine.loadLibrary(resourceName: "gemm", kernelName: "bias_add_kernel")
+        engine.loadLibrary(resourceName: "gemm", kernelName: "relu_kernel")
         
-        // Define dimensions for the matrices
-        var M: UInt32 = 2 // Rows of A/C
-        var K: UInt32 = 3 // Cols of A / Rows of B
-        var N: UInt32 = 2 // Cols of B/C
+        // Define dimensions
+        let batchSize = 2
+        let inputDim = 3
+        let outputDim = 2
         
-        // Step 1: Initialize tensors using UMA zero-copy memory
-        print("\nAllocating shared memory tensors...")
-        let tensorA = Tensor(device: engine.device, rows: Int(M), cols: Int(K))
-        let tensorB = Tensor(device: engine.device, rows: Int(K), cols: Int(N))
-        let tensorC = Tensor(device: engine.device, rows: Int(M), cols: Int(N))
+        // 1. Setup Input Tensor
+        print("\nPreparing input tensor labels...")
+        let input = Tensor(device: engine.device, rows: batchSize, cols: inputDim)
+        let ptrIn = input.pointer()
+        // Input: [ [1, 2, 3], [-4, -5, -6] ]
+        ptrIn[0] = 1; ptrIn[1] = 2; ptrIn[2] = 3
+        ptrIn[3] = -4; ptrIn[4] = -5; ptrIn[5] = -6
         
-        // Seed tensor A with deterministic values
-        let ptrA = tensorA.pointer()
-        ptrA[0] = 1; ptrA[1] = 2; ptrA[2] = 3
-        ptrA[3] = 4; ptrA[4] = 5; ptrA[5] = 6
+        print("Input Tensor (2x3):")
+        input.printMatrix()
         
-        // Seed tensor B with deterministic values
-        let ptrB = tensorB.pointer()
-        ptrB[0] = 7; ptrB[1] = 8
-        ptrB[2] = 9; ptrB[3] = 10
-        ptrB[4] = 11; ptrB[5] = 12
+        // 2. Initialize Linear Layer
+        print("Initializing Linear Layer (Weights: 3x2, Bias: 1x2)...")
+        let linear = LinearLayer(engine: engine, inputDim: inputDim, outputDim: outputDim, batchSize: batchSize)
         
-        print("Matrix A (\(M)x\(K)):")
-        tensorA.printMatrix()
-        print("Matrix B (\(K)x\(N)):")
-        tensorB.printMatrix()
+        // Set deterministic weights for verification
+        // Weight matrix: [ [0.5, -0.5], [1.0, -1.0], [1.5, -1.5] ]
+        let ptrW = linear.weights.pointer()
+        ptrW[0] = 0.5; ptrW[1] = -0.5
+        ptrW[2] = 1.0; ptrW[3] = -1.0
+        ptrW[4] = 1.5; ptrW[5] = -1.5
         
-        // Step 4: Dispatch and Synchronization
-        print("Encoding compute commands...")
-        guard let commandBuffer = engine.commandQueue.makeCommandBuffer(),
-              let computeEncoder = commandBuffer.makeComputeCommandEncoder(),
-              let pipelineState = engine.pipelineState else {
-            fatalError("Failed to create command buffer or encoder")
-        }
+        // Set deterministic bias: [ 0.1, 0.1 ]
+        let ptrB = linear.bias.pointer()
+        ptrB[0] = 0.1; ptrB[1] = 0.1
         
-        computeEncoder.setComputePipelineState(pipelineState)
+        print("Weights (3x2):")
+        linear.weights.printMatrix()
+        print("Bias (1x2):")
+        linear.bias.printMatrix()
         
-        // Set buffers so the GPU can access them directly without data copies
-        computeEncoder.setBuffer(tensorA.buffer, offset: 0, index: 0)
-        computeEncoder.setBuffer(tensorB.buffer, offset: 0, index: 1)
-        computeEncoder.setBuffer(tensorC.buffer, offset: 0, index: 2)
+        // 3. Execute Forward Pass (Chained on GPU)
+        print("Executing Forward Pass: ReLU(X * W + b)...")
+        linear.forward(input: input)
         
-        // Set the dimension variables
-        computeEncoder.setBytes(&M, length: MemoryLayout<UInt32>.size, index: 3)
-        computeEncoder.setBytes(&K, length: MemoryLayout<UInt32>.size, index: 4)
-        computeEncoder.setBytes(&N, length: MemoryLayout<UInt32>.size, index: 5)
+        // 4. Verify Results
+        print("\nForward Pass Results (CPU Pointer):")
+        linear.output.printMatrix()
         
-        // Calculate the thread groupings
-        // A 2D grid covering the entire output matrix (rows=M, cols=N)
-        let threadsPerGrid = MTLSize(width: Int(N), height: Int(M), depth: 1)
+        // Math Verification:
+        // Row 1: [1, 2, 3] * [weights] = [ 1*0.5+2*1+3*1.5, 1*-0.5+2*-1+3*-1.5 ] = [ 0.5+2+4.5, -0.5-2-4.5 ] = [ 7, -7 ]
+        // Add Bias: [ 7+0.1, -7+0.1 ] = [ 7.1, -6.9 ]
+        // ReLU: [ 7.1, 0.0 ]
         
-        // Use optimal threadgroup size bounded by hardware constraints and dimensions
-        let w = pipelineState.threadExecutionWidth
-        let h = pipelineState.maxTotalThreadsPerThreadgroup / w
-        let threadsPerThreadgroup = MTLSize(width: min(w, Int(N)), height: min(h, Int(M)), depth: 1)
+        // Row 2: [-4, -5, -6] * [weights] = [ -4*0.5-5*1-6*1.5, -4*-0.5-5*-1-6*-1.5 ] = [ -2-5-9, 2+5+9 ] = [ -16, 16 ]
+        // Add Bias: [ -16+0.1, 16+0.1 ] = [ -15.9, 16.1 ]
+        // ReLU: [ 0.0, 16.1 ]
         
-        computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-        computeEncoder.endEncoding()
-        
-        // Synchronize: Submit instructions to the GPU and wait for completion
-        print("\nDispatching computation threads to Apple GPU...")
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted() // Blocks the CPU until the GPU math finishes
-        
-        print("\nGPU execution completed. Printing final shared memory results directly from CPU pointer:")
-        print("Matrix C (\(M)x\(N)):")
-        tensorC.printMatrix()
-        
-        print("Expected C:\n[58.0000, 64.0000]\n[139.0000, 154.0000]\n---")
+        print("Expected Results:")
+        print("[7.1000, 0.0000]")
+        print("[0.0000, 16.1000]")
+        print("---")
     }
 }

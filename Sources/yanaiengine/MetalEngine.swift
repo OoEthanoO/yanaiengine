@@ -5,7 +5,7 @@ import Foundation
 public class MetalEngine {
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
-    public private(set) var pipelineState: MTLComputePipelineState?
+    private var pipelineStates: [String: MTLComputePipelineState] = [:]
     
     public init?() {
         // Step 2: Grab the default GPU
@@ -70,10 +70,19 @@ public class MetalEngine {
                 fatalError("ERROR: Failed to find Metal function: '\(kernelName)' in library.")
             }
             
-            self.pipelineState = try device.makeComputePipelineState(function: function)
+            let pso = try device.makeComputePipelineState(function: function)
+            self.pipelineStates[kernelName] = pso
             print("Successfully initialized '\(kernelName)' kernel.")
         } catch {
             fatalError("CRITICAL: Metal loading error: \(error)")
         }
+    }
+    
+    /// Returns a cached pipeline state for the given kernel name.
+    public func getPipelineState(name: String) -> MTLComputePipelineState {
+        guard let pso = pipelineStates[name] else {
+            fatalError("Pipeline state for '\(name)' has not been loaded. Call loadLibrary() first.")
+        }
+        return pso
     }
 }

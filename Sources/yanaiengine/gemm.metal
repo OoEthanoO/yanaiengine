@@ -32,3 +32,36 @@ kernel void gemm_kernel(
     // Write result to C
     C[row * N + col] = sum;
 }
+
+// Kernel to add a 1D bias vector to a 2D matrix (broadcasting bias across rows)
+kernel void bias_add_kernel(
+    device float* matrix [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    constant uint& M [[buffer(2)]], // Rows
+    constant uint& N [[buffer(3)]], // Cols
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    
+    if (row >= M || col >= N) {
+        return;
+    }
+    
+    // Each row adds the same bias vector
+    matrix[row * N + col] += bias[col];
+}
+
+// Element-wise ReLU Activation kernel: f(x) = max(0, x)
+kernel void relu_kernel(
+    device float* data [[buffer(0)]],
+    constant uint& length [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) {
+        return;
+    }
+    
+    float val = data[gid];
+    data[gid] = val > 0.0 ? val : 0.0;
+}
