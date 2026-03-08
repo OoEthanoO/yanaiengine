@@ -161,4 +161,85 @@ public class TransformerBlock {
         cb.commit()
         cb.waitUntilCompleted()
     }
+    
+    // ====================================================
+    // KV-Cached Single-Token Decode
+    // ====================================================
+    
+    private lazy var decodeFfnUp = LinearLayer(engine: engine, inputDim: dModel, outputDim: 4 * dModel, batchSize: 1, useReLU: false)
+    private lazy var decodeFfnDown = LinearLayer(engine: engine, inputDim: 4 * dModel, outputDim: dModel, batchSize: 1, useReLU: false)
+    private lazy var decodeOutput = Tensor(device: engine.device, rows: 1, cols: dModel)
+    private var decodeFfnWeightsCopied = false
+    
+    private func ensureDecodeFfnWeights() {
+        if decodeFfnWeightsCopied { return }
+        memcpy(decodeFfnUp.weights.pointer(), ffnUp.weights.pointer(),
+               ffnUp.weights.rows * ffnUp.weights.cols * MemoryLayout<Float>.stride)
+        memcpy(decodeFfnUp.bias.pointer(), ffnUp.bias.pointer(),
+               ffnUp.bias.cols * MemoryLayout<Float>.stride)
+        memcpy(decodeFfnDown.weights.pointer(), ffnDown.weights.pointer(),
+               ffnDown.weights.rows * ffnDown.weights.cols * MemoryLayout<Float>.stride)
+        memcpy(decodeFfnDown.bias.pointer(), ffnDown.bias.pointer(),
+               ffnDown.bias.cols * MemoryLayout<Float>.stride)
+        decodeFfnWeightsCopied = true
+    }
+    
+    /// CPU-side LayerNorm for a single row [1 x dModel].
+    private func layerNormCPU(_ data: UnsafeMutablePointer<Float>, gamma: Tensor, beta: Tensor) {
+        let gPtr = gamma.pointer()
+        let bPtr = beta.pointer()
+        var sum: Float = 0
+        for c in 0..<dModel { sum += data[c] }
+        let mean = sum / Float(dModel)
+        var varSum: Float = 0
+        for c in 0..<dModel { let d = data[c] - mean; varSum += d * d }
+        let invStd = 1.0 / sqrt(varSum / Float(dModel) + 1e-5)
+        for c in 0..<dModel {
+            data[c] = gPtr[c] * (data[c] - mean) * invStd + bPtr[c]
+        }
+    }
+    
+    /// Forward pass for a single new token using KV cache.
+    /// Input: [1 x dModel]. Returns output [1 x dModel].
+    public func forwardCached(input: Tensor, cache: KVCache) -> Tensor {
+        ensureDecodeFfnWeights()
+        let outPtr = decodeOutput.pointer()
+        let inPtr = input.pointer()
+        
+        // Sub-block 1: x₁ = x + MHA(LayerNorm(x))
+        let ln1 = Tensor(device: engine.device, rows: 1, cols: dModel)
+        memcpy(ln1.pointer(), inPtr, dModel * MemoryLayout<Float>.stride)
+        layerNormCPU(ln1.pointer(), gamma: lnGamma1, beta: lnBeta1)
+        
+        let mhaOut = mha.forwardCached(input: ln1, cache: cache)
+        
+        // Residual 1
+        let res1 = Tensor(device: engine.device, rows: 1, cols: dModel)
+        let res1Ptr = res1.pointer()
+        let mhaPtr = mhaOut.pointer()
+        for d in 0..<dModel { res1Ptr[d] = inPtr[d] + mhaPtr[d] }
+        
+        // Sub-block 2: x₂ = x₁ + FFN(LayerNorm(x₁))
+        let ln2 = Tensor(device: engine.device, rows: 1, cols: dModel)
+        memcpy(ln2.pointer(), res1Ptr, dModel * MemoryLayout<Float>.stride)
+        layerNormCPU(ln2.pointer(), gamma: lnGamma2, beta: lnBeta2)
+        
+        // FFN: Linear → GELU → Linear
+        decodeFfnUp.forward(input: ln2)
+        // CPU GELU on the 4*dModel values
+        let ffnPtr = decodeFfnUp.output.pointer()
+        let ffnDim = 4 * dModel
+        for i in 0..<ffnDim {
+            let x = ffnPtr[i]
+            let cdf = 0.5 * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+            ffnPtr[i] = x * cdf
+        }
+        decodeFfnDown.forward(input: decodeFfnUp.output)
+        
+        // Residual 2
+        let ffnOutPtr = decodeFfnDown.output.pointer()
+        for d in 0..<dModel { outPtr[d] = res1Ptr[d] + ffnOutPtr[d] }
+        
+        return decodeOutput
+    }
 }

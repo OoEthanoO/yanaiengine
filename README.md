@@ -14,6 +14,7 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #6: Transformer Attention**: Scaled Dot-Product Self-Attention with Softmax, Scaling, and Causal Masking.
 - [x] **Goal #7: Full Transformer Block**: Multi-Head Attention, LayerNorm, GELU, Residual Connections — the exact architecture of GPT/Llama.
 - [x] **Goal #8: RoPE & Autoregressive Generation**: Rotary Positional Embeddings, Embedding/LMHead layers, and token-by-token text generation.
+- [x] **Goal #9: KV Cache Inference**: Prefill/Decode loop with KV-cached attention — zero redundant recomputation.
 - [x] **Bare-Metal Kernels**: 16 hand-written MSL kernels: GEMM, RoPE, Softmax, GELU, LayerNorm, Embedding Lookup, and more.
 
 ## Architecture
@@ -22,8 +23,9 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 |-----------|-------------|
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
-| `TransformerBlock.swift` | The LLM core. Pre-Norm with MHA, FFN(GELU), LayerNorm, Residual Connections. |
-| `MultiHeadAttention.swift` | Parallelized attention with **RoPE** positional encoding. |
+| `TransformerBlock.swift` | The LLM core. Pre-Norm with MHA, FFN(GELU), LayerNorm, Residual Connections. Supports KV-cached decode. |
+| `MultiHeadAttention.swift` | Parallelized attention with **RoPE** positional encoding and KV-cached single-token decode. |
+| `KVCache.swift` | Inference optimizer. Per-head Key/Value buffers with position tracking for Prefill/Decode. |
 | `EmbeddingLayer.swift` | Token ID → dense vector lookup via GPU kernel. |
 | `LMHead.swift` | Final projection to vocabulary logits with greedy argmax decoding. |
 | `SelfAttention.swift` | Single-head attention. Q/K/V projections and Scaled Dot-Product Attention. |
@@ -39,12 +41,12 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - A Mac with **Apple Silicon** (M1, M2, M3 series).
 - **Xcode 15+** or the **Swift 6.0+** toolchain.
 
-### Running the LLM Generation Demo
+### Running the KV-Cached LLM Demo
 ```bash
 cd yanaiengine
 swift run
 ```
-Generates text token-by-token using the full LLM pipeline: **Embedding → RoPE → Multi-Head Attention → LayerNorm → FFN(GELU) → LMHead → argmax**. Starts from a seed token and autoregressively predicts the next token at each step.
+Runs a **Prefill/Decode** inference loop: processes the prompt in parallel (Prefill), then generates tokens one at a time using a KV Cache (Decode) — the same architecture as vLLM and TensorRT-LLM.
 
 ### Running via Xcode
 1. In Xcode, select **File > Open...** and select the `yanaiengine` folder (or `Package.swift`).
