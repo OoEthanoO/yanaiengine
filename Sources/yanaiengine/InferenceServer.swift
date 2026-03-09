@@ -1,0 +1,213 @@
+import Foundation
+import Hummingbird
+import NIOHTTP1
+
+/// An asynchronous HTTP server that exposes a Gemini-compatible API for YanAIEngine.
+public actor InferenceServer {
+    private let model: LlamaModel
+    private let sampler: Sampler
+    private let engine: MetalEngine
+    private let tokenizer: Tokenizer?
+    private let stopTokenId: UInt32
+    
+    public init(model: LlamaModel, engine: MetalEngine, tokenizer: Tokenizer? = nil, stopTokenId: UInt32 = 128009) {
+        self.model = model
+        self.engine = engine
+        self.sampler = Sampler()
+        self.tokenizer = tokenizer
+        self.stopTokenId = stopTokenId
+    }
+    
+    /// Start the server on the specified port.
+    public func start(port: Int = 8080) async throws {
+        let router = Router()
+        
+        // Endpoint: Single-shot generation
+        router.post("/v1beta/models/yanai-model:generateContent") { request, context in
+            let geminiReq = try await request.decode(as: GeminiRequest.self, context: context)
+            let response = try await self.handleGenerateContent(geminiReq)
+            let data = try JSONEncoder().encode(response)
+            return Response(
+                status: .ok,
+                headers: [.contentType: "application/json"],
+                body: .init(byteBuffer: ByteBuffer(data: data))
+            )
+        }
+        
+        // Endpoint: Streaming generation (SSE)
+        router.post("/v1beta/models/yanai-model:streamGenerateContent") { request, context in
+            let geminiReq = try await request.decode(as: GeminiRequest.self, context: context)
+            
+            // Get a stream from the actor
+            let tokenStream = await self.generateStream(request: geminiReq)
+            
+            return Response(
+                status: .ok,
+                headers: [.contentType: "text/event-stream"],
+                body: .init { writer in
+                    var writer = writer
+                    for await tokenText in tokenStream {
+                        let chunk = GeminiStreamChunk(
+                            candidates: [
+                                GeminiCandidate(
+                                    content: GeminiContent(role: "model", parts: [GeminiPart(text: tokenText)]),
+                                    finishReason: nil,
+                                    avgLogprobs: nil
+                                )
+                            ],
+                            usageMetadata: nil
+                        )
+                        if let data = try? JSONEncoder().encode(chunk), let jsonString = String(data: data, encoding: .utf8) {
+                            let sseEvent = "data: \(jsonString)\n\n"
+                            try await writer.write(ByteBuffer(string: sseEvent))
+                        }
+                    }
+                    
+                    // Send final chunk
+                    let finalChunk = GeminiStreamChunk(
+                        candidates: [GeminiCandidate(content: GeminiContent(role: "model", parts: []), finishReason: "STOP", avgLogprobs: nil)],
+                        usageMetadata: nil
+                    )
+                    if let data = try? JSONEncoder().encode(finalChunk), let jsonString = String(data: data, encoding: .utf8) {
+                        try await writer.write(ByteBuffer(string: "data: \(jsonString)\n\n"))
+                    }
+                }
+            )
+        }
+        
+        let app = Application(router: router, configuration: .init(address: .hostname("0.0.0.0", port: port)))
+        print("🚀 YanAIEngine Inference Server listening on http://localhost:\(port)")
+        try await app.run()
+    }
+    
+    // MARK: - Handlers
+    
+    private func handleGenerateContent(_ request: GeminiRequest) async throws -> GeminiResponse {
+        let prompt = bridgeGeminiToLlama(request.contents)
+        let config = request.generationConfig
+        
+        // Update sampler settings
+        sampler.temperature = config?.temperature ?? 0.8
+        sampler.topP = config?.topP ?? 0.9
+        sampler.topK = config?.topK ?? 50
+        
+        let generatedText = try await generate(prompt: prompt, maxTokens: config?.maxOutputTokens ?? 512)
+        
+        return GeminiResponse(
+            candidates: [
+                GeminiCandidate(
+                    content: GeminiContent(role: "model", parts: [GeminiPart(text: generatedText)]),
+                    finishReason: "STOP",
+                    avgLogprobs: nil
+                )
+            ],
+            usageMetadata: nil
+        )
+    }
+    
+    func generateStream(request: GeminiRequest) -> AsyncStream<String> {
+        let prompt = bridgeGeminiToLlama(request.contents)
+        let config = request.generationConfig
+        let maxTokens = config?.maxOutputTokens ?? 512
+        
+        return AsyncStream { continuation in
+            Task {
+                // Update sampler settings (accessing actor state safely because we are in the actor's Task)
+                self.sampler.temperature = config?.temperature ?? 0.8
+                self.sampler.topP = config?.topP ?? 0.9
+                self.sampler.topK = config?.topK ?? 50
+                
+                do {
+                    try await self.runGenerationStreaming(prompt: prompt, maxTokens: maxTokens) { tokenText in
+                        continuation.yield(tokenText)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish()
+                }
+            }
+        }
+    }
+    
+    // MARK: - Logic Bridge
+    
+    /// Convert Gemini's multi-turn content array into a single Llama 3 chat prompt.
+    private func bridgeGeminiToLlama(_ contents: [GeminiContent]) -> String {
+        var prompt = "<|begin_of_text|>"
+        for content in contents {
+            let role = content.role ?? "user"
+            let text = content.parts.map { $0.text }.joined(separator: "\n")
+            prompt += "<|start_header_id|>\(role)<|end_header_id|>\n\n\(text)<|eot_id|>"
+        }
+        prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        return prompt
+    }
+    
+    /// Core generation loop (serial execution on the GPU).
+    private func generate(prompt: String, maxTokens: Int) async throws -> String {
+        // Since this is an actor, this whole method is serial.
+        // We'll use the existing LlamaModel & Sampler logic.
+        
+        // Tokenize
+        guard let tokens = tokenizer?.encode(text: prompt) else { return "No tokenizer available" }
+        
+        model.resetCaches()
+        var sequence = tokens
+        
+        // Prefill
+        let logitsPtr = model.prefill(tokenIds: tokens)
+        var logitsCopy = [Float](repeating: 0, count: model.config.vocabSize)
+        for i in 0..<model.config.vocabSize { logitsCopy[i] = logitsPtr[i] }
+        let nextToken = sampler.sample(logits: &logitsCopy, vocabSize: model.config.vocabSize)
+        sequence.append(nextToken)
+        
+        if nextToken == stopTokenId { // <|eot_id|>
+            return tokenizer?.decode(ids: [nextToken]) ?? ""
+        }
+        
+        // Decode loop
+        var result = tokenizer?.decode(ids: [nextToken]) ?? ""
+        for _ in 0..<maxTokens {
+            let decLogits = model.decode(tokenId: sequence.last!)
+            for i in 0..<model.config.vocabSize { logitsCopy[i] = decLogits[i] }
+            let tok = sampler.sample(logits: &logitsCopy, vocabSize: model.config.vocabSize)
+            
+            if tok == stopTokenId { break }
+            sequence.append(tok)
+            result += tokenizer?.decode(ids: [tok]) ?? ""
+        }
+        
+        return result
+    }
+    
+    private func runGenerationStreaming(prompt: String, maxTokens: Int, callback: @Sendable (String) async throws -> Void) async throws {
+        guard let tokens = tokenizer?.encode(text: prompt) else { return }
+        
+        model.resetCaches()
+        var sequence = tokens
+        
+        // Prefill
+        let logitsPtr = model.prefill(tokenIds: tokens)
+        var logitsCopy = [Float](repeating: 0, count: model.config.vocabSize)
+        for i in 0..<model.config.vocabSize { logitsCopy[i] = logitsPtr[i] }
+        let nextToken = sampler.sample(logits: &logitsCopy, vocabSize: model.config.vocabSize)
+        sequence.append(nextToken)
+        
+        let initialText = tokenizer?.decode(ids: [nextToken]) ?? ""
+        try await callback(initialText)
+        
+        if nextToken == stopTokenId { return }
+        
+        // Decode loop
+        for _ in 0..<maxTokens {
+            let decLogits = model.decode(tokenId: sequence.last!)
+            for i in 0..<model.config.vocabSize { logitsCopy[i] = decLogits[i] }
+            let tok = sampler.sample(logits: &logitsCopy, vocabSize: model.config.vocabSize)
+            
+            if tok == stopTokenId { break }
+            sequence.append(tok)
+            let tokenText = tokenizer?.decode(ids: [tok]) ?? ""
+            try await callback(tokenText)
+        }
+    }
+}

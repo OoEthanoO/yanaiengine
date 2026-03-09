@@ -3,10 +3,13 @@ import Metal
 
 @main
 struct yanaiengine {
-    static func main() {
+    static func main() async {
+        let args = CommandLine.arguments
+        let isServer = args.contains("--server")
+        
         print("==============================================")
-        print("  YanAIEngine: Goal #13 — Full Llama Model")
-        print("  Stacked Blocks + Nucleus Sampling + Chat")
+        print("  YanAIEngine: Goal #15 — Inference Server")
+        print("  Gemini-Compatible API + SSE Streaming")
         print("==============================================\n")
         
         guard let engine = MetalEngine() else { fatalError("Metal not available") }
@@ -22,6 +25,34 @@ struct yanaiengine {
             "rmsnorm_kernel", "silu_kernel", "fused_attention_kernel"
         ]
         for kernel in kernels { engine.loadLibrary(resourceName: "gemm", kernelName: kernel) }
+        
+        // ============================================
+        // Initialization
+        // ============================================
+        let config = LlamaConfig.tiny
+        print("  Config: \(config.numLayers) layers, \(config.dModel)d, \(config.numHeads)Q/\(config.numKVHeads)KV, vocab=\(config.vocabSize)")
+        
+        let model = LlamaModel(engine: engine, config: config)
+        
+        if isServer {
+            // Setup a mock tokenizer for the tiny config
+            let mockTokenizer = Tokenizer()
+            mockTokenizer.loadSimple(tokens: (0..<config.vocabSize).map { "\($0)" })
+            
+            let server = InferenceServer(
+                model: model,
+                engine: engine,
+                tokenizer: mockTokenizer,
+                stopTokenId: 0 // Mock eot_id
+            )
+            
+            do {
+                try await server.start(port: 8080)
+            } catch {
+                print("Failed to start server: \(error)")
+            }
+            return
+        }
         
         // ============================================
         // Step 1: Chat Template
@@ -43,11 +74,11 @@ struct yanaiengine {
         // ============================================
         print("=== STEP 2: Sampler Verification ===\n")
         
-        let vocabSize = 10
+        let samplerVocabSize = 10
         let sampler = Sampler(temperature: 0.8, topK: 5, topP: 0.9)
         
         // Create logits where multiple tokens have competitive probabilities
-        var testLogits = [Float](repeating: -10.0, count: vocabSize)
+        var testLogits = [Float](repeating: -10.0, count: samplerVocabSize)
         testLogits[3] = 2.0   // Strong
         testLogits[7] = 1.8   // Close second
         testLogits[1] = 1.5   // Third
@@ -57,9 +88,9 @@ struct yanaiengine {
         print("  Logits: token 3=2.0, token 7=1.8, token 1=1.5, token 5=1.0\n")
         
         // Greedy: should always pick token 3
-        let greedySampler = Sampler(temperature: 0, topK: vocabSize, topP: 1.0)
+        let greedySampler = Sampler(temperature: 0, topK: samplerVocabSize, topP: 1.0)
         var greedyLogits = testLogits
-        let greedyResult = greedySampler.sample(logits: &greedyLogits, vocabSize: vocabSize)
+        let greedyResult = greedySampler.sample(logits: &greedyLogits, vocabSize: samplerVocabSize)
         let greedyPass = greedyResult == 3
         print("  Greedy (T=0):     token \(greedyResult) \(greedyPass ? "✅" : "❌") (expected 3)")
         
@@ -67,7 +98,7 @@ struct yanaiengine {
         var sampledTokens = Set<UInt32>()
         for _ in 0..<50 {
             var logitsCopy = testLogits
-            let token = sampler.sample(logits: &logitsCopy, vocabSize: vocabSize)
+            let token = sampler.sample(logits: &logitsCopy, vocabSize: samplerVocabSize)
             sampledTokens.insert(token)
         }
         let varietyPass = sampledTokens.count > 1
@@ -76,7 +107,7 @@ struct yanaiengine {
         // Top-K=1 should behave like greedy
         let topK1Sampler = Sampler(temperature: 0.8, topK: 1, topP: 1.0)
         var topK1Logits = testLogits
-        let topK1Result = topK1Sampler.sample(logits: &topK1Logits, vocabSize: vocabSize)
+        let topK1Result = topK1Sampler.sample(logits: &topK1Logits, vocabSize: samplerVocabSize)
         let topKPass = topK1Result == 3
         print("  Top-K=1:          token \(topK1Result) \(topKPass ? "✅" : "❌") (expected 3)\n")
         
@@ -84,11 +115,6 @@ struct yanaiengine {
         // Step 3: Full LlamaModel Forward Pass
         // ============================================
         print("=== STEP 3: LlamaModel (Stacked Blocks) ===\n")
-        
-        let config = LlamaConfig.tiny
-        print("  Config: \(config.numLayers) layers, \(config.dModel)d, \(config.numHeads)Q/\(config.numKVHeads)KV, vocab=\(config.vocabSize)")
-        
-        let model = LlamaModel(engine: engine, config: config)
         
         // Fake prompt tokens
         let promptTokens: [UInt32] = [1, 5, 12, 8]
@@ -159,10 +185,6 @@ struct yanaiengine {
         
         if templatePass && greedyPass && varietyPass && multiLayer && logitsFinite && allValid {
             print("\n🚀 Goal #13 COMPLETE: Full LLM pipeline on Apple Silicon!")
-            print("   Model:    \(config.numLayers)-layer LlamaModel (Embed→Blocks→RMSNorm→LMHead)")
-            print("   Sampler:  Temperature + Top-K + Top-P (Nucleus)")
-            print("   Chat:     Llama 3 template with <|eot_id|> stop detection")
-            print("   This is a bespoke llama.cpp alternative, built from scratch.")
         }
     }
     

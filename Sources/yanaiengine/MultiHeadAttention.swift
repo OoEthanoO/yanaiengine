@@ -58,11 +58,6 @@ public class MultiHeadAttention {
         keyProj.forward(input: input)
         valueProj.forward(input: input)
         
-        let qPtr = queryProj.output.pointer()
-        let kPtr = keyProj.output.pointer()
-        let vPtr = valueProj.output.pointer()
-        let concatPtr = concatOutput.pointer()
-        
         // Run fused attention kernel on GPU
         guard let commandBuffer = engine.commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else { fatalError() }
@@ -78,16 +73,20 @@ public class MultiHeadAttention {
         var dh = UInt32(dHead)
         var sc = 1.0 / sqrt(Float(dHead))
         var cm = useCausalMask
+        var nh = UInt32(numHeads)
+        var nkv = UInt32(numHeads) // Standard MHA has numHeads == numKVHeads
         
         encoder.setBytes(&sl, length: MemoryLayout<UInt32>.size, index: 4)
         encoder.setBytes(&dh, length: MemoryLayout<UInt32>.size, index: 5)
         encoder.setBytes(&sc, length: MemoryLayout<Float>.size, index: 6)
         encoder.setBytes(&cm, length: MemoryLayout<Bool>.size, index: 7)
+        encoder.setBytes(&nh, length: MemoryLayout<UInt32>.size, index: 8)
+        encoder.setBytes(&nkv, length: MemoryLayout<UInt32>.size, index: 9)
         
         // Dispatch threads: 
         //   width = seqLen (one thread per token row)
         //   height = 1
-        //   depth = numHeads (one threadgroup per head)
+        //   depth = numHeads (one thread per head)
         encoder.dispatchThreads(MTLSize(width: seqLen, height: 1, depth: numHeads),
                                 threadsPerThreadgroup: MTLSize(width: min(fusedPSO.maxTotalThreadsPerThreadgroup, seqLen), height: 1, depth: 1))
         

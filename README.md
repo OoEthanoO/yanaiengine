@@ -20,6 +20,7 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #12: Llama 3 Architecture**: RMSNorm, SwiGLU FFN, Grouped Query Attention (GQA), and BPE Tokenizer.
 - [x] **Goal #13: Full Model & Sampling**: Stacked LlamaModel, Temperature/Top-K/Top-P nucleus sampling, Llama 3 chat templates.
 - [x] **Goal #14: FlashAttention (Kernel Fusion)**: Smashed the "Memory Wall" with a fused kernel using Online Softmax and tiling to bypass VRAM bottlenecks.
+- [x] **Goal #15: Inference Server & Gemini API**: Turn the engine into a deployable microservice. Implements the Google Gemini API contract (`generateContent` + SSE Streaming) via Hummingbird 2.0.
 - [x] **Bare-Metal Kernels**: 20 hand-written MSL kernels including `gemm`, `q8_gemm`, `rope`, `rmsnorm`, `silu`, and the fused `fused_attention_kernel`.
 
 ## Architecture
@@ -38,6 +39,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `SafetensorsReader.swift` | HuggingFace bridge. Parses `.safetensors` files via POSIX `mmap` (zero-copy). |
 | `gemm.metal` | The math. 20 kernels implementing every layer natively in C++/MSL. |
 | `Interconnect.swift` | The network layer. Asynchronous multi-node synchronization using **SwiftNIO**. |
+| `InferenceServer.swift` | The API layer. Asynchronous Hummingbird server exposing the **Gemini API** via SSE streaming. |
+| `GeminiSchema.swift` | The contract. `Codable` Swift structs mirroring Google's Gemini v1beta JSON schema. |
 
 ## Performance & Infrastructure
 
@@ -48,8 +51,23 @@ In standard attention, computing scores for 4,000 tokens creates a massive $N \t
 By implementing a full **KV-Cache (Goal #9)**, the engine achieves true $O(1)$ complexity per token during generation. Instead of recomputing the past, each layer remembers its $K$ and $V$ states, allowing the decode pass to process only the *newest* token, just like production inference engines like vLLM.
 
 ## Quick Start
+
+### Swift CLI Demo
 ```bash
-cd yanaiengine
-swift run
+# Processes a prompt and generates text token-by-token (KV Cache)
+swift run yanaiengine
 ```
-Runs a **Prefill/Decode** inference loop: processes a prompt, then generates code/text one token at a time using a KV Cache — all natively on Apple Silicon.
+
+### Gemini-Compatible Server
+```bash
+# Boot the HTTP server on port 8080
+swift run yanaiengine --server
+```
+
+### Querying the API
+```bash
+# In a separate terminal:
+curl http://localhost:8080/v1beta/models/yanai-model:generateContent \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"contents": [{"role": "user", "parts": [{"text": "Hello!"}]}]}'
+```

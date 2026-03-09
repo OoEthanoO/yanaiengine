@@ -122,11 +122,6 @@ public class LlamaBlock {
         keyProj.forward(input: rmsOut1)
         valueProj.forward(input: rmsOut1)
         
-        let qPtr = queryProj.output.pointer()
-        let kPtr = keyProj.output.pointer()
-        let vPtr = valueProj.output.pointer()
-        let concatPtr = concatOutput.pointer()
-        
         // Fused GPU attention pass
         guard let cb = engine.commandQueue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else { fatalError() }
@@ -142,16 +137,20 @@ public class LlamaBlock {
         var dh = UInt32(dHead)
         var sc = 1.0 / sqrt(Float(dHead))
         var cm = true // Causal mask always true for prefill in Llama
+        var nh = UInt32(numHeads)
+        var nkv = UInt32(numKVHeads)
         
         enc.setBytes(&sl, length: MemoryLayout<UInt32>.size, index: 4)
         enc.setBytes(&dh, length: MemoryLayout<UInt32>.size, index: 5)
         enc.setBytes(&sc, length: MemoryLayout<Float>.size, index: 6)
         enc.setBytes(&cm, length: MemoryLayout<Bool>.size, index: 7)
+        enc.setBytes(&nh, length: MemoryLayout<UInt32>.size, index: 8)
+        enc.setBytes(&nkv, length: MemoryLayout<UInt32>.size, index: 9)
         
         // Dispatch threads: 
         //   width = seqLen (one thread per token row)
         //   height = 1
-        //   depth = numHeads (one threadgroup per head)
+        //   depth = numHeads (one thread per head)
         enc.dispatchThreads(MTLSize(width: seqLen, height: 1, depth: numHeads),
                             threadsPerThreadgroup: MTLSize(width: min(fusedPSO.maxTotalThreadsPerThreadgroup, seqLen), height: 1, depth: 1))
         

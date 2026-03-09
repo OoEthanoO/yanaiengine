@@ -285,7 +285,7 @@ kernel void rope_kernel(
     device float* data [[buffer(0)]],
     constant uint& seqLen [[buffer(1)]],
     constant uint& dHead [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]]  // x = pair_index, y = position
+    uint3 gid [[thread_position_in_grid]]  // x = pair_index, y = position
 ) {
     uint pos = gid.y;
     uint pair = gid.x;
@@ -413,74 +413,86 @@ kernel void fused_attention_kernel(
     constant uint& dHead [[buffer(5)]],
     constant float& scale [[buffer(6)]],
     constant bool& causal [[buffer(7)]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint gid [[thread_position_in_grid]],
-    uint head_id [[threadgroup_position_in_grid]]
+    constant uint& nHeads [[buffer(8)]],
+    constant uint& nKVHeads [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]]
 ) {
-    // Current head pointers (assuming Q, K, V are [numHeads, seqLen, dHead])
-    // head_id is the head index
-    uint head_offset = head_id * seqLen * dHead;
-    device const float* head_Q = Q + head_offset;
-    device const float* head_K = K + head_offset; // Simplify: assuming numHeads == numKVHeads for now
-    device const float* head_V = V + head_offset;
-    device float* head_O = O + head_offset;
-
-    // Output row this thread handles
-    uint i = gid;
-    if (i >= seqLen) return;
-
-    // Threadgroup blocks
-    const uint Bc = 32; 
+    uint head_id = gid.z;
+    uint i = gid.x;
     
-    // Running Softmax statistics for this row i
-    float m_i = -INFINITY; // running max
-    float l_i = 0.0f;      // running sum(exp(x - m_i))
+    if (head_id >= nHeads || i >= seqLen) return;
+
+    // GQA: multiple Query heads can share one KV head
+    uint kv_head_id = head_id / (nHeads / nKVHeads);
     
-    // Accumulator for the output vector O[i, :]
-    // We store this in registers for this thread (width = dHead)
-    // dHead is typically 64 or 128. If it's too large for registers, we'd need shared memory.
-    // For this implementation, we assume dHead <= 128 and use a loop or local array.
-    float acc_row[128]; // Stack allocation. Caution: might spill to memory on some GPUs.
+    uint q_head_offset = head_id * seqLen * dHead;
+    uint kv_head_offset = kv_head_id * seqLen * dHead;
+    
+    device const float* head_Q = Q + q_head_offset;
+    device const float* head_K = K + kv_head_offset;
+    device const float* head_V = V + kv_head_offset;
+    device float* head_O = O + q_head_offset;
+
+    // Running Softmax statistics for row i
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    
+    float acc_row[128]; // Max dHead supported in register file
     for (uint d = 0; d < dHead; d++) acc_row[d] = 0.0f;
 
-    // Load Q[i, :] into registers
+    // Load and apply RoPE to Q[i, :]
     float q_row[128];
     for (uint d = 0; d < dHead; d++) q_row[d] = head_Q[i * dHead + d];
-
-    // Loop over chunks of K and V
-    for (uint j_start = 0; j_start < seqLen; j_start += Bc) {
-        uint j_end = min(j_start + Bc, seqLen);
-        
-        for (uint j = j_start; j < j_end; j++) {
-            // Apply causal mask
-            if (causal && j > i) continue;
-
-            // S[i, j] = Q[i, :] * K[j, :] * scale
-            float s_ij = 0.0f;
-            for (uint d = 0; d < dHead; d++) {
-                s_ij += q_row[d] * head_K[j * dHead + d];
-            }
-            s_ij *= scale;
-
-            // Online Softmax update
-            float m_prev = m_i;
-            m_i = max(m_prev, s_ij);
-            
-            float exp_val = exp(s_ij - m_i);
-            float p_scale = exp(m_prev - m_i);
-            
-            // Rescale previous accumulator
-            for (uint d = 0; d < dHead; d++) {
-                acc_row[d] = acc_row[d] * p_scale;
-                acc_row[d] += exp_val * head_V[j * dHead + d];
-            }
-            
-            // Update running sum
-            l_i = l_i * p_scale + exp_val;
-        }
+    
+    // RoPE for Q
+    for (uint p = 0; p < dHead / 2; p++) {
+        float theta = float(i) / pow(10000.0, float(2 * p) / float(dHead));
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        float q0 = q_row[2 * p];
+        float q1 = q_row[2 * p + 1];
+        q_row[2 * p] = q0 * cos_t - q1 * sin_t;
+        q_row[2 * p + 1] = q0 * sin_t + q1 * cos_t;
     }
 
-    // Final normalization and write to global O
+    // Outer loop over K/V keys (attending to all previous tokens)
+    for (uint j = 0; j < seqLen; j++) {
+        // Apply causal mask
+        if (causal && j > i) continue;
+
+        // Load K[j, :] and apply RoPE
+        float k_row[128];
+        for (uint d = 0; d < dHead; d++) k_row[d] = head_K[j * dHead + d];
+        
+        for (uint p = 0; p < dHead / 2; p++) {
+            float theta = float(j) / pow(10000.0, float(2 * p) / float(dHead));
+            float cos_t = cos(theta);
+            float sin_t = sin(theta);
+            float k0 = k_row[2 * p];
+            float k1 = k_row[2 * p + 1];
+            k_row[2 * p] = k0 * cos_t - k1 * sin_t;
+            k_row[2 * p + 1] = k0 * sin_t + k1 * cos_t;
+        }
+
+        // S[i, j] = Q[i] * K[j] * scale
+        float s_ij = 0.0f;
+        for (uint d = 0; d < dHead; d++) s_ij += q_row[d] * k_row[d];
+        s_ij *= scale;
+
+        // Online Softmax update
+        float m_prev = m_i;
+        m_i = max(m_prev, s_ij);
+        float exp_val = exp(s_ij - m_i);
+        float p_scale = exp(m_prev - m_i);
+        
+        // Rescale accumulator and add V[j]
+        for (uint d = 0; d < dHead; d++) {
+            acc_row[d] = acc_row[d] * p_scale + exp_val * head_V[j * dHead + d];
+        }
+        l_i = l_i * p_scale + exp_val;
+    }
+
+    // Final normalization
     for (uint d = 0; d < dHead; d++) {
         head_O[i * dHead + d] = acc_row[d] / l_i;
     }
