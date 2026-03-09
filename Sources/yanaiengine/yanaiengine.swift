@@ -19,7 +19,7 @@ struct yanaiengine {
             "softmax_kernel", "scale_kernel", "causal_mask_kernel",
             "gelu_kernel", "layernorm_kernel", "elementwise_add_kernel",
             "rope_kernel", "embedding_lookup_kernel", "q8_gemm_kernel",
-            "rmsnorm_kernel", "silu_kernel"
+            "rmsnorm_kernel", "silu_kernel", "fused_attention_kernel"
         ]
         for kernel in kernels { engine.loadLibrary(resourceName: "gemm", kernelName: kernel) }
         

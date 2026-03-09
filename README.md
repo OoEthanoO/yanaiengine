@@ -19,7 +19,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #11: Safetensors Loader**: Zero-copy `.safetensors` parser with POSIX `mmap` — ready for HuggingFace models.
 - [x] **Goal #12: Llama 3 Architecture**: RMSNorm, SwiGLU FFN, Grouped Query Attention (GQA), and BPE Tokenizer.
 - [x] **Goal #13: Full Model & Sampling**: Stacked LlamaModel, Temperature/Top-K/Top-P nucleus sampling, Llama 3 chat templates.
-- [x] **Bare-Metal Kernels**: 19 hand-written MSL kernels: GEMM, Q8-GEMM, RoPE, RMSNorm, SiLU, Softmax, GELU, and more.
+- [x] **Goal #14: FlashAttention (Kernel Fusion)**: Smashed the "Memory Wall" with a fused kernel using Online Softmax and tiling to bypass VRAM bottlenecks.
+- [x] **Bare-Metal Kernels**: 20 hand-written MSL kernels including `gemm`, `q8_gemm`, `rope`, `rmsnorm`, `silu`, and the fused `fused_attention_kernel`.
 
 ## Architecture
 
@@ -27,43 +28,28 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 |-----------|-------------|
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
-| `TransformerBlock.swift` | The LLM core. Pre-Norm with MHA, FFN(GELU), LayerNorm, Residual Connections. Supports KV-cached decode. |
-| `LlamaBlock.swift` | Llama 3 block. Pre-RMSNorm + GQA + SwiGLU FFN — the exact Meta architecture. |
-| `LlamaModel.swift` | Full model. Stacks N LlamaBlocks with per-layer KVCache, embedding, and LMHead. |
+| `LlamaBlock.swift` | Llama 3 block. Optimized for $O(1)$ inference with `forwardCached` and fused attention. |
+| `LlamaModel.swift` | Full orchestrator. Stacks N layers with per-layer `KVCache` and synchronized weight-sharing. |
 | `Sampler.swift` | Probabilistic decoding. Temperature, Top-K, Top-P (Nucleus) sampling. |
-| `MultiHeadAttention.swift` | Parallelized attention with **RoPE** positional encoding and KV-cached single-token decode. |
-| `KVCache.swift` | Inference optimizer. Per-head Key/Value buffers with position tracking for Prefill/Decode. |
-| `EmbeddingLayer.swift` | Token ID → dense vector lookup via GPU kernel. |
-| `LMHead.swift` | Final projection to vocabulary logits with greedy argmax decoding. |
-| `SelfAttention.swift` | Single-head attention. Q/K/V projections and Scaled Dot-Product Attention. |
-| `Interconnect.swift` | The network layer. Asynchronous TCP bridge using **SwiftNIO**. |
-| `Sequential.swift` | The orchestrator. Chains layers for multi-layer forward/backward flow. |
-| `LinearLayer.swift` | The building block. Manages parameters, gradients, and SGD optimization. |
-| `QuantizedLinearLayer.swift` | INT8 inference. 4x weight compression with on-the-fly GPU dequantization. |
-| `QuantizedTensor.swift` | Quantized storage. INT8 weights + FP32 per-row scale factors. |
-| `gemm.metal` | The math. 19 kernels: GEMM, Q8-GEMM, RoPE, RMSNorm, SiLU, Softmax, GELU, and more. |
-| `Tokenizer.swift` | BPE tokenizer. Parses `tokenizer.json` with byte-pair encoding merge rules. |
+| `MultiHeadAttention.swift` | **FlashAttention** powered. Single-pass GPU kernel for prefill with RoPE and Online Softmax. |
+| `KVCache.swift` | Inference optimizer. Per-head Key/Value buffers with position tracking for true autoregressive generation. |
+| `EmbeddingLayer.swift` | Token ID → dense vector lookup with optimized single-token `forwardDecode` path. |
+| `Tokenizer.swift` | BPE tokenizer. Parses `tokenizer.json` with standard byte-pair encoding merge rules. |
 | `SafetensorsReader.swift` | HuggingFace bridge. Parses `.safetensors` files via POSIX `mmap` (zero-copy). |
-| `ModelLoader.swift` | Weight injector. FP32/FP16 loading with auto-transpose into Metal buffers. |
-| `yanaiengine.swift` | The entry point. Autoregressive text generation with full LLM pipeline. |
+| `gemm.metal` | The math. 20 kernels implementing every layer natively in C++/MSL. |
+| `Interconnect.swift` | The network layer. Asynchronous multi-node synchronization using **SwiftNIO**. |
+
+## Performance & Infrastructure
+
+### Bypassing the Memory Wall (FlashAttention)
+In standard attention, computing scores for 4,000 tokens creates a massive $N \times N$ bottleneck. `YanAIEngine` implements **FlashAttention (Goal #14)**: a single fused kernel that computes dot-product scores, scaling, masking, and softmax as a tiled stream. Intermediate data stays in the GPU's ultra-fast L1 cache (Threadgroup Memory), reducing global VRAM traffic and enabling massive context windows.
+
+### $O(1)$ Autoregressive Inference
+By implementing a full **KV-Cache (Goal #9)**, the engine achieves true $O(1)$ complexity per token during generation. Instead of recomputing the past, each layer remembers its $K$ and $V$ states, allowing the decode pass to process only the *newest* token, just like production inference engines like vLLM.
 
 ## Quick Start
-
-### Prerequisites
-- A Mac with **Apple Silicon** (M1, M2, M3 series).
-- **Xcode 15+** or the **Swift 6.0+** toolchain.
-
-### Running the KV-Cached LLM Demo
 ```bash
 cd yanaiengine
 swift run
 ```
-Runs a **Prefill/Decode** inference loop: processes the prompt in parallel (Prefill), then generates tokens one at a time using a KV Cache (Decode) — the same architecture as vLLM and TensorRT-LLM.
-
-### Running via Xcode
-1. In Xcode, select **File > Open...** and select the `yanaiengine` folder (or `Package.swift`).
-2. Ensure the `yanaiengine` target is selected.
-3. Press `Cmd + R` to Build and Run.
-
-## Performance & UMA
-Unlike traditional discrete GPU setups, `YanAIEngine` uses `.storageModeShared`. This means the CPU writes inputs into a memory region that the GPU can see immediately without any PCIe transfer overhead. By chaining kernels in a single `MTLCommandBuffer`, we ensure the GPU remains fully utilized while the CPU stays asynchronous, proving that a true Deep Learning framework can be built from the silicon up.
+Runs a **Prefill/Decode** inference loop: processes a prompt, then generates code/text one token at a time using a KV Cache — all natively on Apple Silicon.

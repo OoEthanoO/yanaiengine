@@ -127,129 +127,37 @@ public class LlamaBlock {
         let vPtr = valueProj.output.pointer()
         let concatPtr = concatOutput.pointer()
         
-        let kvGroupSize = numHeads / numKVHeads  // Queries per KV head
+        // Fused GPU attention pass
+        guard let cb = engine.commandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { fatalError() }
         
-        for h in 0..<numHeads {
-            let kvHead = h / kvGroupSize  // Which KV head this Q head uses
-            let qOffset = h * dHead
-            let kvOffset = kvHead * dHead
-            let kvDim = numKVHeads * dHead
-            
-            // Extract Q_h, K_h, V_h slices and apply RoPE
-            let qhBuffer = Tensor(device: engine.device, rows: seqLen, cols: dHead)
-            let khBuffer = Tensor(device: engine.device, rows: seqLen, cols: dHead)
-            let vhBuffer = Tensor(device: engine.device, rows: seqLen, cols: dHead)
-            let qhPtr = qhBuffer.pointer()
-            let khPtr = khBuffer.pointer()
-            let vhPtr = vhBuffer.pointer()
-            
-            for row in 0..<seqLen {
-                for col in 0..<dHead {
-                    qhPtr[row * dHead + col] = qPtr[row * (numHeads * dHead) + qOffset + col]
-                    khPtr[row * dHead + col] = kPtr[row * kvDim + kvOffset + col]
-                    vhPtr[row * dHead + col] = vPtr[row * kvDim + kvOffset + col]
-                }
-            }
-            
-            // GPU attention pass for this head
-            guard let cb = engine.commandQueue.makeCommandBuffer(),
-                  let enc = cb.makeComputeCommandEncoder() else { fatalError() }
-            
-            // RoPE on Q_h and K_h
-            let ropePSO = engine.getPipelineState(name: "rope_kernel")
-            var ropeSeq = UInt32(seqLen)
-            var ropeDHead = UInt32(dHead)
-            let numPairs = dHead / 2
-            
-            enc.setComputePipelineState(ropePSO)
-            enc.setBuffer(qhBuffer.buffer, offset: 0, index: 0)
-            enc.setBytes(&ropeSeq, length: MemoryLayout<UInt32>.size, index: 1)
-            enc.setBytes(&ropeDHead, length: MemoryLayout<UInt32>.size, index: 2)
-            enc.dispatchThreads(MTLSize(width: numPairs, height: seqLen, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-            
-            enc.setBuffer(khBuffer.buffer, offset: 0, index: 0)
-            enc.dispatchThreads(MTLSize(width: numPairs, height: seqLen, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-            
-            // Transpose K_h → [dHead x seqLen]
-            let transPSO = engine.getPipelineState(name: "transpose_kernel")
-            enc.setComputePipelineState(transPSO)
-            enc.setBuffer(khBuffer.buffer, offset: 0, index: 0)
-            enc.setBuffer(keyTransposed.buffer, offset: 0, index: 1)
-            var tR = UInt32(seqLen); var tC = UInt32(dHead)
-            enc.setBytes(&tR, length: MemoryLayout<UInt32>.size, index: 2)
-            enc.setBytes(&tC, length: MemoryLayout<UInt32>.size, index: 3)
-            enc.dispatchThreads(MTLSize(width: dHead, height: seqLen, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-            
-            // Scores = Q_h × K_h^T [seqLen × seqLen]
-            let gemmPSO = engine.getPipelineState(name: "gemm_kernel")
-            enc.setComputePipelineState(gemmPSO)
-            enc.setBuffer(qhBuffer.buffer, offset: 0, index: 0)
-            enc.setBuffer(keyTransposed.buffer, offset: 0, index: 1)
-            enc.setBuffer(qkScores.buffer, offset: 0, index: 2)
-            var gM = UInt32(seqLen); var gK = UInt32(dHead); var gN = UInt32(seqLen)
-            enc.setBytes(&gM, length: MemoryLayout<UInt32>.size, index: 3)
-            enc.setBytes(&gK, length: MemoryLayout<UInt32>.size, index: 4)
-            enc.setBytes(&gN, length: MemoryLayout<UInt32>.size, index: 5)
-            enc.dispatchThreads(MTLSize(width: seqLen, height: seqLen, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-            
-            // Scale
-            let scalePSO = engine.getPipelineState(name: "scale_kernel")
-            enc.setComputePipelineState(scalePSO)
-            enc.setBuffer(qkScores.buffer, offset: 0, index: 0)
-            var scaleLen = UInt32(seqLen * seqLen)
-            var scaleVal = 1.0 / sqrt(Float(dHead))
-            enc.setBytes(&scaleLen, length: MemoryLayout<UInt32>.size, index: 1)
-            enc.setBytes(&scaleVal, length: MemoryLayout<Float>.size, index: 2)
-            enc.dispatchThreads(MTLSize(width: seqLen * seqLen, height: 1, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: min(scalePSO.maxTotalThreadsPerThreadgroup, seqLen * seqLen), height: 1, depth: 1))
-            
-            // Causal mask
-            let maskPSO = engine.getPipelineState(name: "causal_mask_kernel")
-            enc.setComputePipelineState(maskPSO)
-            enc.setBuffer(qkScores.buffer, offset: 0, index: 0)
-            var maskN = UInt32(seqLen)
-            enc.setBytes(&maskN, length: MemoryLayout<UInt32>.size, index: 1)
-            enc.dispatchThreads(MTLSize(width: seqLen, height: seqLen, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-            
-            // Softmax
-            let softPSO = engine.getPipelineState(name: "softmax_kernel")
-            enc.setComputePipelineState(softPSO)
-            enc.setBuffer(qkScores.buffer, offset: 0, index: 0)
-            var sR = UInt32(seqLen); var sC = UInt32(seqLen)
-            enc.setBytes(&sR, length: MemoryLayout<UInt32>.size, index: 1)
-            enc.setBytes(&sC, length: MemoryLayout<UInt32>.size, index: 2)
-            enc.dispatchThreads(MTLSize(width: seqLen, height: 1, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: min(softPSO.maxTotalThreadsPerThreadgroup, seqLen), height: 1, depth: 1))
-            
-            // Head output = softmax(scores) × V_h [seqLen × dHead]
-            enc.setComputePipelineState(gemmPSO)
-            enc.setBuffer(qkScores.buffer, offset: 0, index: 0)
-            enc.setBuffer(vhBuffer.buffer, offset: 0, index: 1)
-            enc.setBuffer(headOutput.buffer, offset: 0, index: 2)
-            var hM = UInt32(seqLen); var hK = UInt32(seqLen); var hN = UInt32(dHead)
-            enc.setBytes(&hM, length: MemoryLayout<UInt32>.size, index: 3)
-            enc.setBytes(&hK, length: MemoryLayout<UInt32>.size, index: 4)
-            enc.setBytes(&hN, length: MemoryLayout<UInt32>.size, index: 5)
-            enc.dispatchThreads(MTLSize(width: dHead, height: seqLen, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-            
-            enc.endEncoding()
-            cb.commit()
-            cb.waitUntilCompleted()
-            
-            // Copy head output into concat buffer
-            let hoPtr = headOutput.pointer()
-            for row in 0..<seqLen {
-                for col in 0..<dHead {
-                    concatPtr[row * (numHeads * dHead) + qOffset + col] = hoPtr[row * dHead + col]
-                }
-            }
-        }
+        let fusedPSO = engine.getPipelineState(name: "fused_attention_kernel")
+        enc.setComputePipelineState(fusedPSO)
+        enc.setBuffer(queryProj.output.buffer, offset: 0, index: 0)
+        enc.setBuffer(keyProj.output.buffer, offset: 0, index: 1)
+        enc.setBuffer(valueProj.output.buffer, offset: 0, index: 2)
+        enc.setBuffer(concatOutput.buffer, offset: 0, index: 3)
+        
+        var sl = UInt32(seqLen)
+        var dh = UInt32(dHead)
+        var sc = 1.0 / sqrt(Float(dHead))
+        var cm = true // Causal mask always true for prefill in Llama
+        
+        enc.setBytes(&sl, length: MemoryLayout<UInt32>.size, index: 4)
+        enc.setBytes(&dh, length: MemoryLayout<UInt32>.size, index: 5)
+        enc.setBytes(&sc, length: MemoryLayout<Float>.size, index: 6)
+        enc.setBytes(&cm, length: MemoryLayout<Bool>.size, index: 7)
+        
+        // Dispatch threads: 
+        //   width = seqLen (one thread per token row)
+        //   height = 1
+        //   depth = numHeads (one threadgroup per head)
+        enc.dispatchThreads(MTLSize(width: seqLen, height: 1, depth: numHeads),
+                            threadsPerThreadgroup: MTLSize(width: min(fusedPSO.maxTotalThreadsPerThreadgroup, seqLen), height: 1, depth: 1))
+        
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
         
         // Output projection
         outputProj.forward(input: concatOutput)

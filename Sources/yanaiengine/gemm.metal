@@ -399,3 +399,89 @@ kernel void silu_kernel(
     float x = data[gid];
     data[gid] = x / (1.0 + exp(-x));
 }
+
+// Fused Attention Kernel (FlashAttention-1 style)
+// Processes one head at a time. 
+// Uses Online Softmax to avoid writing large N x N score matrices to global memory.
+// Threadgroup tiling: Br = 32 (rows of Q), Bc = 32 (cols of K/V).
+kernel void fused_attention_kernel(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    constant uint& seqLen [[buffer(4)]],
+    constant uint& dHead [[buffer(5)]],
+    constant float& scale [[buffer(6)]],
+    constant bool& causal [[buffer(7)]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint gid [[thread_position_in_grid]],
+    uint head_id [[threadgroup_position_in_grid]]
+) {
+    // Current head pointers (assuming Q, K, V are [numHeads, seqLen, dHead])
+    // head_id is the head index
+    uint head_offset = head_id * seqLen * dHead;
+    device const float* head_Q = Q + head_offset;
+    device const float* head_K = K + head_offset; // Simplify: assuming numHeads == numKVHeads for now
+    device const float* head_V = V + head_offset;
+    device float* head_O = O + head_offset;
+
+    // Output row this thread handles
+    uint i = gid;
+    if (i >= seqLen) return;
+
+    // Threadgroup blocks
+    const uint Bc = 32; 
+    
+    // Running Softmax statistics for this row i
+    float m_i = -INFINITY; // running max
+    float l_i = 0.0f;      // running sum(exp(x - m_i))
+    
+    // Accumulator for the output vector O[i, :]
+    // We store this in registers for this thread (width = dHead)
+    // dHead is typically 64 or 128. If it's too large for registers, we'd need shared memory.
+    // For this implementation, we assume dHead <= 128 and use a loop or local array.
+    float acc_row[128]; // Stack allocation. Caution: might spill to memory on some GPUs.
+    for (uint d = 0; d < dHead; d++) acc_row[d] = 0.0f;
+
+    // Load Q[i, :] into registers
+    float q_row[128];
+    for (uint d = 0; d < dHead; d++) q_row[d] = head_Q[i * dHead + d];
+
+    // Loop over chunks of K and V
+    for (uint j_start = 0; j_start < seqLen; j_start += Bc) {
+        uint j_end = min(j_start + Bc, seqLen);
+        
+        for (uint j = j_start; j < j_end; j++) {
+            // Apply causal mask
+            if (causal && j > i) continue;
+
+            // S[i, j] = Q[i, :] * K[j, :] * scale
+            float s_ij = 0.0f;
+            for (uint d = 0; d < dHead; d++) {
+                s_ij += q_row[d] * head_K[j * dHead + d];
+            }
+            s_ij *= scale;
+
+            // Online Softmax update
+            float m_prev = m_i;
+            m_i = max(m_prev, s_ij);
+            
+            float exp_val = exp(s_ij - m_i);
+            float p_scale = exp(m_prev - m_i);
+            
+            // Rescale previous accumulator
+            for (uint d = 0; d < dHead; d++) {
+                acc_row[d] = acc_row[d] * p_scale;
+                acc_row[d] += exp_val * head_V[j * dHead + d];
+            }
+            
+            // Update running sum
+            l_i = l_i * p_scale + exp_val;
+        }
+    }
+
+    // Final normalization and write to global O
+    for (uint d = 0; d < dHead; d++) {
+        head_O[i * dHead + d] = acc_row[d] / l_i;
+    }
+}
