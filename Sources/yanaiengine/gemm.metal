@@ -517,3 +517,106 @@ kernel void fused_attention_kernel(
         head_O[i * dHead + d] = acc_row[d] / l_i;
     }
 }
+
+// Paged Attention Kernel
+// Instead of a flat [seqLen x dHead] buffer, K and V are stored in non-contiguous physical blocks.
+// block_table: [num_logical_pages] mapping to physical block indices.
+kernel void paged_fused_attention_kernel(
+    device const float* Q [[buffer(0)]],
+    device const float* K_pool [[buffer(1)]],
+    device const float* V_pool [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    constant uint& seqLen [[buffer(4)]],
+    constant uint& dHead [[buffer(5)]],
+    constant float& scale [[buffer(6)]],
+    constant bool& causal [[buffer(7)]],
+    constant uint& nHeads [[buffer(8)]],
+    constant uint& nKVHeads [[buffer(9)]],
+    constant float& logit_cap [[buffer(10)]],
+    constant int& window_size [[buffer(11)]],
+    device const int* block_table [[buffer(12)]],
+    constant int& block_size [[buffer(13)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint head_id = gid.z;
+    uint i = gid.x;
+    
+    if (head_id >= nHeads || i >= seqLen) return;
+
+    uint kv_head_id = head_id / (nHeads / nKVHeads);
+    uint q_head_offset = head_id * seqLen * dHead;
+    device const float* head_Q = Q + q_head_offset;
+    device float* head_O = O + q_head_offset;
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float acc_row[128];
+    for (uint d = 0; d < dHead; d++) acc_row[d] = 0.0f;
+
+    float q_row[128];
+    for (uint d = 0; d < dHead; d++) q_row[d] = head_Q[i * dHead + d];
+    
+    for (uint p = 0; p < dHead / 2; p++) {
+        float theta = float(i) / pow(10000.0, float(2 * p) / float(dHead));
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        float q0 = q_row[2 * p];
+        float q1 = q_row[2 * p + 1];
+        q_row[2 * p] = q0 * cos_t - q1 * sin_t;
+        q_row[2 * p + 1] = q0 * sin_t + q1 * cos_t;
+    }
+
+    // Outer loop over logical tokens j
+    for (uint j = 0; j < seqLen; j++) {
+        if (causal && j > i) continue;
+        if (window_size > 0 && (int)i - (int)j >= window_size) continue;
+
+        // Resolve logical token j to physical memory in the pool
+        uint page_idx = j / block_size;
+        uint offset_in_block = j % block_size;
+        int physical_block_idx = block_table[page_idx];
+
+        // Memory layout in pool: [numBlocks][nKVHeads][blockSize][dHead]
+        uint block_stride = nKVHeads * block_size * dHead;
+        uint head_stride = block_size * dHead;
+        uint pool_offset = (physical_block_idx * block_stride) + (kv_head_id * head_stride) + (offset_in_block * dHead);
+
+        device const float* k_row_ptr = K_pool + pool_offset;
+        device const float* v_row_ptr = V_pool + pool_offset;
+
+        float k_row[128];
+        for (uint d = 0; d < dHead; d++) k_row[d] = k_row_ptr[d];
+        
+        for (uint p = 0; p < dHead / 2; p++) {
+            float theta = float(j) / pow(10000.0, float(2 * p) / float(dHead));
+            float cos_t = cos(theta);
+            float sin_t = sin(theta);
+            float k0 = k_row[2 * p];
+            float k1 = k_row[2 * p + 1];
+            k_row[2 * p] = k0 * cos_t - k1 * sin_t;
+            k_row[2 * p + 1] = k0 * sin_t + k1 * cos_t;
+        }
+
+        float s_ij = 0.0f;
+        for (uint d = 0; d < dHead; d++) s_ij += q_row[d] * k_row[d];
+        s_ij *= scale;
+
+        if (logit_cap > 0.0f) {
+            s_ij = logit_cap * tanh(s_ij / logit_cap);
+        }
+
+        float m_prev = m_i;
+        m_i = max(m_prev, s_ij);
+        float exp_val = exp(s_ij - m_i);
+        float p_scale = exp(m_prev - m_i);
+        
+        for (uint d = 0; d < dHead; d++) {
+            acc_row[d] = acc_row[d] * p_scale + exp_val * v_row_ptr[d];
+        }
+        l_i = l_i * p_scale + exp_val;
+    }
+
+    for (uint d = 0; d < dHead; d++) {
+        head_O[i * dHead + d] = acc_row[d] / l_i;
+    }
+}

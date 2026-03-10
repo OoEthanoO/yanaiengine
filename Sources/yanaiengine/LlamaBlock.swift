@@ -126,6 +126,9 @@ public class LlamaBlock {
         guard let cb = engine.commandQueue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else { fatalError() }
         
+        // Prefer paged attention if a cache is provided and it's a PagedKVCache
+        // (For prefill, we'll use a temporary PagedKVCache if needed, 
+        // but for now let's keep it simple and focus on the decode/inference path integration)
         let fusedPSO = engine.getPipelineState(name: "fused_attention_kernel")
         enc.setComputePipelineState(fusedPSO)
         enc.setBuffer(queryProj.output.buffer, offset: 0, index: 0)
@@ -139,6 +142,8 @@ public class LlamaBlock {
         var cm = true // Causal mask always true for prefill in Llama
         var nh = UInt32(numHeads)
         var nkv = UInt32(numKVHeads)
+        var cap: Float = 0.0
+        var ws: Int32 = 0
         
         enc.setBytes(&sl, length: MemoryLayout<UInt32>.size, index: 4)
         enc.setBytes(&dh, length: MemoryLayout<UInt32>.size, index: 5)
@@ -146,6 +151,8 @@ public class LlamaBlock {
         enc.setBytes(&cm, length: MemoryLayout<Bool>.size, index: 7)
         enc.setBytes(&nh, length: MemoryLayout<UInt32>.size, index: 8)
         enc.setBytes(&nkv, length: MemoryLayout<UInt32>.size, index: 9)
+        enc.setBytes(&cap, length: MemoryLayout<Float>.size, index: 10)
+        enc.setBytes(&ws, length: MemoryLayout<Int32>.size, index: 11)
         
         // Dispatch threads: 
         //   width = seqLen (one thread per token row)

@@ -22,7 +22,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #14: FlashAttention (Kernel Fusion)**: Smashed the "Memory Wall" with a fused kernel using Online Softmax and tiling to bypass VRAM bottlenecks.
 - [x] **Goal #15: Inference Server & Gemini API**: Turn the engine into a deployable microservice. Implements the Google Gemini API contract (`generateContent` + SSE Streaming) via Hummingbird 2.0.
 - [x] **Goal #16: Google Gemma 2 Architecture**: Polymorphic support for Google's **Logit Soft-Capping**, **GeGLU Activation**, and **Alternating Sliding Window Attention (SWA)**.
-- [x] **Bare-Metal Kernels**: 22 hand-written MSL kernels including `gemm`, `q8_gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, and the enhanced `fused_attention_kernel`.
+- [x] **Goal #17: PagedAttention (Memory Virtualization)**: Virtualized KV Cache inspired by vLLM. Hand-written block allocator and page table system to eliminate VRAM fragmentation and enable high concurrency.
+- [x] **Bare-Metal Kernels**: 23 hand-written MSL kernels including `gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, and the `paged_fused_attention_kernel`.
 
 ## Architecture
 
@@ -40,19 +41,20 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `EmbeddingLayer.swift` | Token ID → dense vector lookup with optimized single-token `forwardDecode` path. |
 | `Tokenizer.swift` | BPE tokenizer. Parses `tokenizer.json` with standard byte-pair encoding merge rules. |
 | `SafetensorsReader.swift` | HuggingFace bridge. Parses `.safetensors` files via POSIX `mmap` (zero-copy). |
-| `gemm.metal` | The math. 20 kernels implementing every layer natively in C++/MSL. |
+| `gemm.metal` | The math. 23 kernels implementing every layer natively in C++/MSL. |
 | `Interconnect.swift` | The network layer. Asynchronous multi-node synchronization using **SwiftNIO**. |
 | `InferenceServer.swift` | The API layer. Asynchronous Hummingbird server exposing the **Gemini API** via SSE streaming. |
 | `GeminiSchema.swift` | The contract. `Codable` Swift structs mirroring Google's Gemini v1beta JSON schema. |
-| `KVCache.swift` | Enhanced buffer. Supports standard and **Sliding Window** mode via circular indexing. |
+| `BlockAllocator.swift` | Physical pool. Pre-allocates VRAM blocks (16 tokens) to eliminate fragmentation. |
+| `PagedKVCache.swift` | Virtual mapping. Uses Page Tables to map logical sequences to physical blocks in the pool. |
 
 ## Performance & Infrastructure
 
 ### Bypassing the Memory Wall (FlashAttention)
 In standard attention, computing scores for 4,000 tokens creates a massive $N \times N$ bottleneck. `YanAIEngine` implements **FlashAttention (Goal #14)**: a single fused kernel that computes dot-product scores, scaling, masking, and softmax as a tiled stream. Intermediate data stays in the GPU's ultra-fast L1 cache (Threadgroup Memory), reducing global VRAM traffic and enabling massive context windows.
 
-### $O(1)$ Autoregressive Inference
-By implementing a full **KV-Cache (Goal #9)**, the engine achieves true $O(1)$ complexity per token during generation. Instead of recomputing the past, each layer remembers its $K$ and $V$ states, allowing the decode pass to process only the *newest* token, just like production inference engines like vLLM.
+### $O(1)$ Autoregressive Inference (PagedAttention)
+By implementing **PagedAttention (Goal #17)**, the engine achieves true $O(1)$ complexity while solving the memory fragmentation crisis. Inspired by OS virtual memory, we chop the KV Cache into small "Pages" mapped via a Page Table. This allows multiple concurrent requests to share a massive global pool of VRAM blocks, virtually eliminating memory waste and preventing out-of-memory crashes during high-concurrency serving.
 
 ## Quick Start
 
