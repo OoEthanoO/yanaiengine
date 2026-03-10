@@ -35,7 +35,9 @@ public class LlamaModel {
                 dModel: config.dModel,
                 numHeads: config.numHeads,
                 numKVHeads: config.numKVHeads,
-                ffnMultiplier: config.ffnMultiplier
+                ffnMultiplier: config.ffnMultiplier,
+                numExperts: config.numExperts,
+                numExpertsPerToken: config.numExpertsPerToken
             )
         }
         
@@ -250,6 +252,10 @@ public struct LlamaConfig: Sendable {
     public let maxSeqLen: Int
     public let ffnMultiplier: Float
     
+    // MoE Parameters
+    public let numExperts: Int?
+    public let numExpertsPerToken: Int?
+    
     /// Llama 3 8B default config
     public static let llama3_8B = LlamaConfig(
         vocabSize: 128256,
@@ -272,13 +278,23 @@ public struct LlamaConfig: Sendable {
         ffnMultiplier: 2.6875
     )
     
-    public init(vocabSize: Int, dModel: Int, numHeads: Int, numKVHeads: Int, numLayers: Int, maxSeqLen: Int, ffnMultiplier: Float) {
-        self.vocabSize = vocabSize
-        self.dModel = dModel
-        self.numHeads = numHeads
-        self.numKVHeads = numKVHeads
-        self.numLayers = numLayers
-        self.maxSeqLen = maxSeqLen
         self.ffnMultiplier = ffnMultiplier
+        self.numExperts = numExperts
+        self.numExpertsPerToken = numExpertsPerToken
+    }
+    
+    /// Mixtral-style MoE config
+    public static func mixtral_8x7B() -> LlamaConfig {
+        return LlamaConfig(
+            vocabSize: 32000,
+            dModel: 4096,
+            numHeads: 32,
+            numKVHeads: 8,
+            numLayers: 32,
+            maxSeqLen: 4096,
+            ffnMultiplier: 3.5,
+            numExperts: 8,
+            numExpertsPerToken: 2
+        )
     }
 }

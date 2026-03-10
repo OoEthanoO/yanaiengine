@@ -735,3 +735,112 @@ kernel void batched_paged_attention_kernel(
         head_O[d] = acc_row[d] / l_i;
     }
 }
+
+// Router Softmax + Top-K Kernel
+// Computes softmax over expert logits and selects the top K experts.
+kernel void router_softmax_topk_kernel(
+    device const float* logits [[buffer(0)]],
+    device int* indices [[buffer(1)]],
+    device float* weights [[buffer(2)]],
+    constant uint& num_experts [[buffer(3)]],
+    constant uint& k [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint row_offset = gid * num_experts;
+    device const float* row_logits = logits + row_offset;
+    
+    // 1. Find Max for Softmax Stability
+    float max_logit = -INFINITY;
+    for (uint i = 0; i < num_experts; i++) {
+        max_logit = max(max_logit, row_logits[i]);
+    }
+    
+    // 2. Compute Exp and Sum
+    float sum_exp = 0.0f;
+    float probs[32]; // Assumes max experts < 32 for local buffer
+    for (uint i = 0; i < num_experts; i++) {
+        probs[i] = exp(row_logits[i] - max_logit);
+        sum_exp += probs[i];
+    }
+    
+    // 3. Normalize Probs
+    for (uint i = 0; i < num_experts; i++) {
+        probs[i] /= sum_exp;
+    }
+    
+    // 4. Find Top-K (Selection Sort approach for small K)
+    device int* out_indices = indices + (gid * k);
+    device float* out_weights = weights + (gid * k);
+    
+    bool used[32];
+    for (uint i = 0; i < num_experts; i++) used[i] = false;
+    
+    for (uint selection = 0; selection < k; selection++) {
+        float best_prob = -1.0f;
+        int best_idx = -1;
+        
+        for (uint i = 0; i < num_experts; i++) {
+            if (!used[i] && probs[i] > best_prob) {
+                best_prob = probs[i];
+                best_idx = int(i);
+            }
+        }
+        
+        if (best_idx != -1) {
+            out_indices[selection] = best_idx;
+            out_weights[selection] = best_prob;
+            used[best_idx] = true;
+        } else {
+            out_indices[selection] = -1;
+            out_weights[selection] = 0.0f;
+        }
+    }
+    
+    // 5. Re-normalize Top-K weights to sum to 1
+    float topk_sum = 0.0f;
+    for (uint selection = 0; selection < k; selection++) {
+        topk_sum += out_weights[selection];
+    }
+    if (topk_sum > 0.0f) {
+        for (uint selection = 0; selection < k; selection++) {
+            out_weights[selection] /= topk_sum;
+        }
+    }
+}
+
+// MoE Routing & Recombination Kernel
+// This kernel performs the weighted sum of expert outputs.
+// selected_indices: [totalTokens x K] (Int32)
+// selected_weights: [totalTokens x K] (Float)
+// expert_outputs: [num_experts x totalTokens x dModel]
+// final_output: [totalTokens x dModel]
+kernel void moe_combine_kernel(
+    device const int* selected_indices [[buffer(0)]],
+    device const float* selected_weights [[buffer(1)]],
+    device const float* expert_outputs [[buffer(2)]],
+    device float* final_output [[buffer(3)]],
+    constant uint& dModel [[buffer(4)]],
+    constant uint& k [[buffer(5)]],
+    constant uint& total_tokens [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]] // x=d, y=token_idx
+) {
+    uint d = gid.x;
+    uint token_idx = gid.y;
+    
+    if (d >= dModel || token_idx >= total_tokens) return;
+    
+    float acc = 0.0f;
+    for (uint i = 0; i < k; i++) {
+        int expert_idx = selected_indices[token_idx * k + i];
+        float weight = selected_weights[token_idx * k + i];
+        
+        if (expert_idx >= 0) {
+            // Index into the specific expert's output for this token
+            // Layout: expert_outputs[expert_idx][token_idx][d]
+            uint offset = (uint(expert_idx) * total_tokens * dModel) + (token_idx * dModel) + d;
+            acc += weight * expert_outputs[offset];
+        }
+    }
+    
+    final_output[token_idx * dModel + d] = acc;
+}

@@ -23,7 +23,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #15: Inference Server & Gemini API**: Turn the engine into a deployable microservice. Implements the Google Gemini API contract (`generateContent` + SSE Streaming) via Hummingbird 2.0.
 - [x] **Goal #16: Google Gemma 2 Architecture**: Polymorphic support for Google's **Logit Soft-Capping**, **GeGLU Activation**, and **Alternating Sliding Window Attention (SWA)**.
 - [x] **Goal #17: PagedAttention (Memory Virtualization)**: Virtualized KV Cache inspired by vLLM. Hand-written block allocator and page table system to eliminate VRAM fragmentation and enable high concurrency.
-- [x] **Goal #18: Continuous Batching (In-Flight Batching)**: ORCA-style scheduling that decouples requests from GPU cycles. Dynamically interleaves prefill and decode phases for multiple concurrent users to maximize hardware utilization.
+- [x] **Goal #18: Continuous Batching (ORCA-style scheduling)**: ORCA-style scheduling that decouples requests from GPU cycles. Dynamically interleaves prefill and decode phases for multiple concurrent users to maximize hardware utilization.
+- [x] **Goal #19: Mixture of Experts (MoE) & Sparse Routing**
 - [x] **Bare-Metal Kernels**: 24 hand-written MSL kernels including `gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, `paged_fused_attention_kernel`, and the `batched_paged_attention_kernel`.
 
 ## Architecture
@@ -48,7 +49,10 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `GeminiSchema.swift` | The contract. `Codable` Swift structs mirroring Google's Gemini v1beta JSON schema. |
 | `BlockAllocator.swift` | Physical pool. Pre-allocates VRAM blocks (16 tokens) to eliminate fragmentation. |
 | `PagedKVCache.swift` | Virtual mapping. Uses Page Tables to map logical sequences to physical blocks in the pool. |
-| `Scheduler.swift` | The heart of throughput. Manages asynchronous request queues for **Continuous Batching**. |
+| `Scheduler.swift` | Manages request queues and Continuous Batching loop |
+| `Router.swift` | Gating network for Sparse MoE Routing |
+| `MoELayer.swift` | Encapsulates expert-partitioned Feed-Forward Networks |
+| `ModelLoader.swift` | Unified loader for Safetensors and quantized experts |
 
 ## Performance & Infrastructure
 

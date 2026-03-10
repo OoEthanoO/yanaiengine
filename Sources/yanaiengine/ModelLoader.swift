@@ -98,4 +98,36 @@ public class ModelLoader {
         
         return Float(bitPattern: result)
     }
+    
+    /// Load weights for an MoELayer from expert-partitioned tensors.
+    public static func loadMoELayer(
+        reader: SafetensorsReader,
+        layerPrefix: String,
+        into moe: MoELayer
+    ) throws {
+        // Load Router weights
+        try loadLinearLayer(
+            reader: reader,
+            weightName: "\(layerPrefix).mlp.gate.weight",
+            biasName: nil,
+            into: moe.router.weights.rowAsLinear() // Helper needed or direct copy
+        )
+        
+        // Load Experts
+        for i in 0..<moe.experts.count {
+            let expertPrefix = "\(layerPrefix).mlp.experts.\(i)"
+            try loadLinearLayer(reader: reader, weightName: "\(expertPrefix).w1.weight", biasName: nil, into: moe.experts[i].gateProj)
+            try loadLinearLayer(reader: reader, weightName: "\(expertPrefix).w3.weight", biasName: nil, into: moe.experts[i].upProj)
+            try loadLinearLayer(reader: reader, weightName: "\(expertPrefix).w2.weight", biasName: nil, into: moe.experts[i].downProj)
+        }
+    }
+}
+
+extension Tensor {
+    /// Returns a temporary LinearLayer-like object to use the loading logic.
+    func rowAsLinear() -> LinearLayer {
+        // This is a hack for the loader, in reality we'd just load weights directly.
+        // For now, let's just use the direct loading logic in loadMoELayer.
+        return LinearLayer(engine: MetalEngine.shared, rows: self.rows, cols: self.cols, existingBuffer: self.buffer)
+    }
 }
