@@ -844,3 +844,47 @@ kernel void moe_combine_kernel(
     
     final_output[token_idx * dModel + d] = acc;
 }
+
+// Patch Embedding Kernel
+// image: [3 x H x W] (Float)
+// weights: [dEmbed x 3 x patch_size x patch_size]
+// output: [(H/patch_size)*(W/patch_size) x dEmbed]
+kernel void patch_embedding_kernel(
+    device const float* image [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& h [[buffer(4)]],
+    constant uint& w [[buffer(5)]],
+    constant uint& patch_size [[buffer(6)]],
+    constant uint& d_embed [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]] // x=patch_idx, y=d_idx
+) {
+    uint patches_w = w / patch_size;
+    uint patch_idx = gid.x;
+    uint d_idx = gid.y;
+    
+    if (patch_idx >= (h/patch_size) * patches_w || d_idx >= d_embed) return;
+    
+    uint patch_y = patch_idx / patches_w;
+    uint patch_x = patch_idx % patches_w;
+    
+    uint start_y = patch_y * patch_size;
+    uint start_x = patch_x * patch_size;
+    
+    float acc = bias[d_idx];
+    
+    // Weight index: [d_idx][channel][py][px]
+    // Image index: [channel][y][x]
+    for (uint c = 0; c < 3; c++) {
+        for (uint py = 0; py < patch_size; py++) {
+            for (uint px = 0; px < patch_size; px++) {
+                float img_val = image[(c * h * w) + ((start_y + py) * w) + (start_x + px)];
+                float weight_val = weights[(d_idx * 3 * patch_size * patch_size) + (c * patch_size * patch_size) + (py * patch_size) + px];
+                acc += img_val * weight_val;
+            }
+        }
+    }
+    
+    output[patch_idx * d_embed + d_idx] = acc;
+}

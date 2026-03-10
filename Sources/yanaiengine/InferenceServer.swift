@@ -9,11 +9,18 @@ public actor InferenceServer {
     private let tokenizer: Tokenizer?
     private let stopTokenId: UInt32
     
+    // Multimodal Components
+    private let visionEncoder: SigLIPEncoder
+    private let projector: MultimodalProjector
+    
     public init(model: LlamaModel, scheduler: Scheduler, tokenizer: Tokenizer? = nil, stopTokenId: UInt32 = 128009) {
         self.model = model
         self.scheduler = scheduler
         self.tokenizer = tokenizer
         self.stopTokenId = stopTokenId
+        
+        self.visionEncoder = SigLIPEncoder(engine: model.blocks[0].outputProj.weights.buffer.device.description.contains("Apple") ? MetalEngine.shared : MetalEngine.shared) // Need cleaner engine access
+        self.projector = MultimodalProjector(engine: MetalEngine.shared, visionDim: 1152, llmDim: model.config.dModel)
     }
     
     /// Start the server on the specified port.
@@ -98,6 +105,12 @@ public actor InferenceServer {
             }
             
             var result = ""
+            // Process Images if present
+            var visualEmbeds: Tensor? = nil
+            if let base64Image = request.contents.first?.parts.compactMap({ $0.inlineData?.data }).first {
+                visualEmbeds = self.processImage(base64Image)
+            }
+            
             let seq = SequenceRequest(
                 promptTokens: tokens,
                 numLayers: model.config.numLayers,
@@ -106,7 +119,8 @@ public actor InferenceServer {
                 maxTokens: maxTokens,
                 stopTokenId: stopTokenId,
                 onTokenGenerated: { text in result += text },
-                onCompletion: { continuation.resume(returning: result) }
+                onCompletion: { continuation.resume(returning: result) },
+                visualEmbeddings: visualEmbeds
             )
             
             Task {
@@ -142,6 +156,12 @@ public actor InferenceServer {
                 return
             }
             
+            // Process Images if present
+            var visualEmbeds: Tensor? = nil
+            if let base64Image = request.contents.first?.parts.compactMap({ $0.inlineData?.data }).first {
+                visualEmbeds = self.processImage(base64Image)
+            }
+            
             // This is messy - we need to fix the allocator access.
             // For now, assume model has access to allocator.
             let seq = SequenceRequest(
@@ -152,7 +172,8 @@ public actor InferenceServer {
                 maxTokens: maxTokens,
                 stopTokenId: stopTokenId,
                 onTokenGenerated: { text in continuation.yield(text) },
-                onCompletion: { continuation.finish() }
+                onCompletion: { continuation.finish() },
+                visualEmbeddings: visualEmbeds
             )
             
             Task {
@@ -170,9 +191,20 @@ public actor InferenceServer {
             let role = content.role ?? "user"
             let text = content.parts.map { $0.text }.joined(separator: "\n")
             prompt += "<|start_header_id|>\(role)<|end_header_id|>\n\n\(text)<|eot_id|>"
-        }
-        prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
         return prompt
+    }
+    
+    /// Decodes base64 image, runs SigLIP, and projects to LLM space.
+    private func processImage(_ base64: String) -> Tensor {
+        // 1. Decode base64 to Tensor [3 x 224 x 224]
+        // (Placeholder: In a real app we'd use ImageIO or similar)
+        let imgTensor = Tensor(device: MetalEngine.shared.device, rows: 3, cols: 224 * 224)
+        
+        // 2. Vision Encoder
+        let vTokens = visionEncoder.forward(image: imgTensor)
+        
+        // 3. Project to LLM Space
+        return projector.forward(visionTokens: vTokens)
     }
     
     /// Core generation loop (serial execution on the GPU).

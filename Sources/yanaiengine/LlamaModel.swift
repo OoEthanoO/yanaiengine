@@ -163,9 +163,18 @@ public class LlamaModel {
         
         // 3. Embed all tokens at once
         embedding.forward(tokenIds: allInputTokens)
-        var current = embedding.output // [totalTokens x dModel]
+        var current: Tensor
         
-        // 4. Update Physical KV Pools (KV Cache Append)
+        // 4. Splicing Visual Tokens
+        if batch.contains(where: { $0.visualEmbeddings != nil }) {
+            // Multimodal splicing: concatenate [Visual Embeds] + [Text Embeds]
+            // For PaliGemma, visual tokens come BEFORE text tokens.
+            current = spliceModalities(batch: batch, textEmbeds: embedding.output, qStarts: qStarts)
+        } else {
+            current = embedding.output // Standard text-only [totalTokens x dModel]
+        }
+        
+        // 5. Update Physical KV Pools (KV Cache Append)
         // We handle this layer-by-layer during the forward pass by passing the batch info
         // But for simplicity in this implementation, let's assume the Attention kernel
         // will read from the pool. We still need to WRITE the new tokens to the pool first.
@@ -177,14 +186,24 @@ public class LlamaModel {
             
             for i in 0..<batchSize {
                 let req = batch[i]
-                let numNew = Int(qStarts[i+1] - qStarts[i])
-                let globalStart = Int(qStarts[i])
+                let visionCount = req.visualEmbeddings?.rows ?? 0
+                let textCount = Int(qStarts[i+1] - qStarts[i])
+                let numTotalNew = visionCount + textCount
                 
-                for t in 0..<numNew {
+                // We need to calculate where this sequence's KV tokens start in the batch output
+                // This is a bit complex because the batch output is spliced.
+                var batchOffset = 0
+                for j in 0..<i {
+                    let prevVision = batch[j].visualEmbeddings?.rows ?? 0
+                    let prevText = Int(qStarts[j+1] - qStarts[j])
+                    batchOffset += prevVision + prevText
+                }
+                
+                for t in 0..<numTotalNew {
                     req.pagedKVCache[layerIdx].appendFromFull(
                         kTensor: kLayer,
                         vTensor: vLayer,
-                        tokenIdx: globalStart + t
+                        tokenIdx: batchOffset + t
                     )
                 }
             }
@@ -216,6 +235,36 @@ public class LlamaModel {
         }
         
         return resultPointers
+    }
+    
+    /// Concatenates visual embeddings and text embeddings into a single ragged tensor.
+    private func spliceModalities(batch: [SequenceRequest], textEmbeds: Tensor, qStarts: [UInt32]) -> Tensor {
+        var totalSplicedTokens = 0
+        for i in 0..<batch.count {
+            let visionCount = batch[i].visualEmbeddings?.rows ?? 0
+            let textCount = Int(qStarts[i+1] - qStarts[i])
+            totalSplicedTokens += visionCount + textCount
+        }
+        
+        let spliced = Tensor(device: engine.device, rows: totalSplicedTokens, cols: config.dModel)
+        let sPtr = spliced.pointer()
+        let tPtr = textEmbeds.pointer()
+        
+        var currentOffset = 0
+        for i in 0..<batch.count {
+            if let vEmbeds = batch[i].visualEmbeddings {
+                let vCount = vEmbeds.rows
+                memcpy(sPtr + currentOffset * config.dModel, vEmbeds.pointer(), vCount * config.dModel * 4)
+                currentOffset += vCount
+            }
+            
+            let tCount = Int(qStarts[i+1] - qStarts[i])
+            let tOffset = Int(qStarts[i])
+            memcpy(sPtr + currentOffset * config.dModel, tPtr + tOffset * config.dModel, tCount * config.dModel * 4)
+            currentOffset += tCount
+        }
+        
+        return spliced
     }
     
     private func dispatchRMSNorm(data: Tensor, gamma: Tensor, rows: Int) {

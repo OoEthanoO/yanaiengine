@@ -11,6 +11,9 @@ public class SequenceRequest: Identifiable {
     public let maxTokens: Int
     public let stopTokenId: UInt32
     
+    // Vision Tokens (Projected Embeddings)
+    public var visualEmbeddings: Tensor? // [numPatches x dModel]
+    
     // Callback to stream tokens back to the client
     public let onTokenGenerated: (String) -> Void
     public let onCompletion: () -> Void
@@ -19,7 +22,8 @@ public class SequenceRequest: Identifiable {
     public var isPrefillDone: Bool = false
     
     public var totalTokens: Int {
-        return promptTokens.count + generatedTokens.count
+        let visionCount = visualEmbeddings?.rows ?? 0
+        return visionCount + promptTokens.count + generatedTokens.count
     }
     
     public init(promptTokens: [UInt32], 
@@ -29,13 +33,15 @@ public class SequenceRequest: Identifiable {
                 maxTokens: Int, 
                 stopTokenId: UInt32,
                 onTokenGenerated: @escaping (String) -> Void,
-                onCompletion: @escaping () -> Void) {
+                onCompletion: @escaping () -> Void,
+                visualEmbeddings: Tensor? = nil) {
         self.promptTokens = promptTokens
         self.sampler = sampler
         self.maxTokens = maxTokens
         self.stopTokenId = stopTokenId
         self.onTokenGenerated = onTokenGenerated
         self.onCompletion = onCompletion
+        self.visualEmbeddings = visualEmbeddings
         
         // Initialize independent paged cache per layer
         self.pagedKVCache = (0..<numLayers).map { _ in
