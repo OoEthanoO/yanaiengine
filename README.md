@@ -25,7 +25,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #17: PagedAttention (Memory Virtualization)**: Virtualized KV Cache inspired by vLLM. Hand-written block allocator and page table system to eliminate VRAM fragmentation and enable high concurrency.
 - [x] **Goal #18: Continuous Batching (ORCA-style scheduling)**: ORCA-style scheduling that decouples requests from GPU cycles. Dynamically interleaves prefill and decode phases for multiple concurrent users to maximize hardware utilization.
 - [x] **Goal #19: Mixture of Experts (MoE) & Sparse Routing**
-- [x] **Bare-Metal Kernels**: 24 hand-written MSL kernels including `gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, `paged_fused_attention_kernel`, and the `batched_paged_attention_kernel`.
+- [x] **Goal #20**: Multimodal VLM (PaliGemma) & Vision-Language Fusion
+- [x] **Bare-Metal Kernels**: 26 hand-written MSL kernels including `gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, `paged_fused_attention_kernel`, `moe_combine_kernel`, and `patch_embedding_kernel`.
 
 ## Architecture
 
@@ -52,7 +53,9 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `Scheduler.swift` | Manages request queues and Continuous Batching loop |
 | `Router.swift` | Gating network for Sparse MoE Routing |
 | `MoELayer.swift` | Encapsulates expert-partitioned Feed-Forward Networks |
-| `ModelLoader.swift` | Unified loader for Safetensors and quantized experts |
+| `SigLIPEncoder.swift` | Vision Transformer (ViT) for high-density image encoding |
+| `MultimodalProjector.swift` | Linear bridge aligning visual and textual latent spaces |
+| `ModelLoader.swift` | Unified loader for Safetensors, quantized experts, and vision weights |
 
 ## Performance & Infrastructure
 
