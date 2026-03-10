@@ -10,6 +10,7 @@ public class LlamaModel {
     public let embedding: EmbeddingLayer
     public let blocks: [LlamaBlock]
     public let caches: [KVCache]
+    public let allocator: BlockAllocator
     private let finalNormGamma: Tensor
     public let lmHead: LMHead
     
@@ -37,6 +38,14 @@ public class LlamaModel {
                 ffnMultiplier: config.ffnMultiplier
             )
         }
+        
+        self.allocator = BlockAllocator(
+            device: engine.device,
+            numBlocks: 1024,
+            blockSize: 16,
+            numKVHeads: config.numKVHeads,
+            dHead: config.dModel / config.numHeads
+        )
         
         self.caches = (0..<config.numLayers).map { _ in
             KVCache(
@@ -116,6 +125,113 @@ public class LlamaModel {
         decodeLmHead.forward(input: current)
         
         return decodeLmHead.logits.pointer()
+    }
+    
+    /// Performs one forward step for a batch of sequences (Continuous Batching).
+    /// Returns an array of pointers to the logits of the last token for each sequence.
+    public func forwardStep(batch: [SequenceRequest], allocator: BlockAllocator) -> [UnsafeMutablePointer<Float>] {
+        let batchSize = batch.count
+        var totalTokens = 0
+        var qStarts: [UInt32] = [0]
+        var contextLens: [UInt32] = []
+        var allInputTokens: [UInt32] = []
+        
+        // 1. Prepare Metadata & Concatenate Inputs
+        var maxBlocks = 0
+        for req in batch {
+            let nextTokens = req.getNextInput()
+            allInputTokens.append(contentsOf: nextTokens)
+            totalTokens += nextTokens.count
+            qStarts.append(UInt32(totalTokens))
+            
+            let newLen = UInt32(req.totalTokens + nextTokens.count) // total length after this step
+            contextLens.append(newLen)
+            maxBlocks = max(maxBlocks, req.pagedKVCache[0].pageTable.count + 1) // +1 for safety
+        }
+        
+        // 2. Build Block Tables tensor [batchSize x maxBlocks]
+        let blockTablesTensor = Tensor(device: engine.device, rows: batchSize, cols: maxBlocks)
+        let btPtr = blockTablesTensor.buffer.contents().bindMemory(to: Int32.self, capacity: batchSize * maxBlocks)
+        for i in 0..<batchSize {
+            let table = batch[i].pagedKVCache[0].pageTable // Blocks are shared across layers for same seq
+            for j in 0..<table.count {
+                btPtr[i * maxBlocks + j] = Int32(table[j])
+            }
+        }
+        
+        // 3. Embed all tokens at once
+        embedding.forward(tokenIds: allInputTokens)
+        var current = embedding.output // [totalTokens x dModel]
+        
+        // 4. Update Physical KV Pools (KV Cache Append)
+        // We handle this layer-by-layer during the forward pass by passing the batch info
+        // But for simplicity in this implementation, let's assume the Attention kernel
+        // will read from the pool. We still need to WRITE the new tokens to the pool first.
+        // We'll use a specialized kernel later, or just CPU-side copy for now.
+        for layerIdx in 0..<config.numLayers {
+            // Write new K/V tokens for this layer to the physical pool
+            let kLayer = blocks[layerIdx].keyProj.output
+            let vLayer = blocks[layerIdx].valueProj.output
+            
+            for i in 0..<batchSize {
+                let req = batch[i]
+                let numNew = Int(qStarts[i+1] - qStarts[i])
+                let globalStart = Int(qStarts[i])
+                
+                for t in 0..<numNew {
+                    req.pagedKVCache[layerIdx].appendFromFull(
+                        kTensor: kLayer,
+                        vTensor: vLayer,
+                        tokenIdx: globalStart + t
+                    )
+                }
+            }
+            
+            // Pass through LlamaBlock
+            current = blocks[layerIdx].forwardBatched(
+                input: current,
+                qStarts: qStarts,
+                contextLens: contextLens,
+                blockTables: blockTablesTensor,
+                maxBlocksPerSeq: maxBlocks,
+                allocator: allocator,
+                layerIdx: layerIdx
+            )
+        }
+        
+        // 5. Final Normalization (Batched)
+        dispatchRMSNorm(data: current, gamma: finalNormGamma, rows: totalTokens)
+        
+        // 6. LMHead (Batched)
+        lmHead.forward(input: current)
+        let allLogits = lmHead.logits.pointer()
+        
+        // 7. Extract last-token logits for each request
+        var resultPointers: [UnsafeMutablePointer<Float>] = []
+        for i in 0..<batchSize {
+            let lastTokenGlobalIdx = Int(qStarts[i + 1]) - 1
+            resultPointers.append(allLogits + (lastTokenGlobalIdx * config.vocabSize))
+        }
+        
+        return resultPointers
+    }
+    
+    private func dispatchRMSNorm(data: Tensor, gamma: Tensor, rows: Int) {
+        guard let cb = engine.commandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { fatalError() }
+        let pso = engine.getPipelineState(name: "rmsnorm_kernel")
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(data.buffer, offset: 0, index: 0)
+        enc.setBuffer(gamma.buffer, offset: 0, index: 1)
+        var r = UInt32(rows); var c = UInt32(config.dModel); var eps: Float = 1e-5
+        enc.setBytes(&r, length: MemoryLayout<UInt32>.size, index: 2)
+        enc.setBytes(&c, length: MemoryLayout<UInt32>.size, index: 3)
+        enc.setBytes(&eps, length: MemoryLayout<Float>.size, index: 4)
+        enc.dispatchThreads(MTLSize(width: rows, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(pso.maxTotalThreadsPerThreadgroup, rows), height: 1, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
     }
     
     /// Reset all KV caches for a new conversation.

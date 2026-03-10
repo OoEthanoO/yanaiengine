@@ -23,7 +23,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #15: Inference Server & Gemini API**: Turn the engine into a deployable microservice. Implements the Google Gemini API contract (`generateContent` + SSE Streaming) via Hummingbird 2.0.
 - [x] **Goal #16: Google Gemma 2 Architecture**: Polymorphic support for Google's **Logit Soft-Capping**, **GeGLU Activation**, and **Alternating Sliding Window Attention (SWA)**.
 - [x] **Goal #17: PagedAttention (Memory Virtualization)**: Virtualized KV Cache inspired by vLLM. Hand-written block allocator and page table system to eliminate VRAM fragmentation and enable high concurrency.
-- [x] **Bare-Metal Kernels**: 23 hand-written MSL kernels including `gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, and the `paged_fused_attention_kernel`.
+- [x] **Goal #18: Continuous Batching (In-Flight Batching)**: ORCA-style scheduling that decouples requests from GPU cycles. Dynamically interleaves prefill and decode phases for multiple concurrent users to maximize hardware utilization.
+- [x] **Bare-Metal Kernels**: 24 hand-written MSL kernels including `gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, `paged_fused_attention_kernel`, and the `batched_paged_attention_kernel`.
 
 ## Architecture
 
@@ -47,14 +48,15 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `GeminiSchema.swift` | The contract. `Codable` Swift structs mirroring Google's Gemini v1beta JSON schema. |
 | `BlockAllocator.swift` | Physical pool. Pre-allocates VRAM blocks (16 tokens) to eliminate fragmentation. |
 | `PagedKVCache.swift` | Virtual mapping. Uses Page Tables to map logical sequences to physical blocks in the pool. |
+| `Scheduler.swift` | The heart of throughput. Manages asynchronous request queues for **Continuous Batching**. |
 
 ## Performance & Infrastructure
 
 ### Bypassing the Memory Wall (FlashAttention)
 In standard attention, computing scores for 4,000 tokens creates a massive $N \times N$ bottleneck. `YanAIEngine` implements **FlashAttention (Goal #14)**: a single fused kernel that computes dot-product scores, scaling, masking, and softmax as a tiled stream. Intermediate data stays in the GPU's ultra-fast L1 cache (Threadgroup Memory), reducing global VRAM traffic and enabling massive context windows.
 
-### $O(1)$ Autoregressive Inference (PagedAttention)
-By implementing **PagedAttention (Goal #17)**, the engine achieves true $O(1)$ complexity while solving the memory fragmentation crisis. Inspired by OS virtual memory, we chop the KV Cache into small "Pages" mapped via a Page Table. This allows multiple concurrent requests to share a massive global pool of VRAM blocks, virtually eliminating memory waste and preventing out-of-memory crashes during high-concurrency serving.
+### $O(1)$ Autoregressive Inference (PagedAttention & Continuous Batching)
+By implementing **PagedAttention (Goal #17)** and **Continuous Batching (Goal #18)**, the engine achieves massive concurrent throughput. We chop the KV Cache into small "Pages" mapped via a Page Table, allowing the **Scheduler** to dynamically pack tokens from multiple users into every single GPU compute cycle. This solves both the "Memory Wall" (fragmentation) and the "Utilization Wall" (idle silicon), enabling data center-scale serving on a single Mac.
 
 ## Quick Start
 

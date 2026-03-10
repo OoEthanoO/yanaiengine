@@ -199,6 +199,104 @@ public class LlamaBlock {
         dispatchAdd(a: residual1, b: downProj.output, out: output, length: totalLen)
     }
     
+    /// Batched forward pass for Continuous Batching.
+    public func forwardBatched(input: Tensor, 
+                               qStarts: [UInt32], 
+                               contextLens: [UInt32], 
+                               blockTables: Tensor, 
+                               maxBlocksPerSeq: Int,
+                               allocator: BlockAllocator,
+                               layerIdx: Int) -> Tensor {
+        let totalTokens = input.rows
+        let totalLen = totalTokens * dModel
+        
+        // Scratch for batched operations
+        let bRmsOut1 = Tensor(device: engine.device, rows: totalTokens, cols: dModel)
+        let bConcatOut = Tensor(device: engine.device, rows: totalTokens, cols: dModel)
+        let bResidual1 = Tensor(device: engine.device, rows: totalTokens, cols: dModel)
+        let bOutput = Tensor(device: engine.device, rows: totalTokens, cols: dModel)
+        
+        // 1. RMSNorm
+        memcpy(bRmsOut1.buffer.contents(), input.buffer.contents(), totalLen * MemoryLayout<Float>.stride)
+        dispatchRMSNorm(data: bRmsOut1, gamma: rmsGamma1, rows: totalTokens)
+        
+        // 2. Projections
+        queryProj.forward(input: bRmsOut1)
+        keyProj.forward(input: bRmsOut1)
+        valueProj.forward(input: bRmsOut1)
+        
+        // 3. Batched Ragged Attention
+        guard let cb = engine.commandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { fatalError() }
+        
+        let pso = engine.getPipelineState(name: "batched_paged_attention_kernel")
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(queryProj.output.buffer, offset: 0, index: 0)
+        enc.setBuffer(allocator.keyBuffer, offset: 0, index: 1)
+        enc.setBuffer(allocator.valueBuffer, offset: 0, index: 2)
+        enc.setBuffer(bConcatOut.buffer, offset: 0, index: 3)
+        
+        // Metadata
+        let qStartsBuf = engine.device.makeBuffer(bytes: qStarts, length: qStarts.count * MemoryLayout<UInt32>.size, options: .storageModeShared)
+        let cLensBuf = engine.device.makeBuffer(bytes: contextLens, length: contextLens.count * MemoryLayout<UInt32>.size, options: .storageModeShared)
+        
+        enc.setBuffer(qStartsBuf, offset: 0, index: 4)
+        enc.setBuffer(cLensBuf, offset: 0, index: 5)
+        
+        var dh = UInt32(dHead)
+        var sc = 1.0 / sqrt(Float(dHead))
+        var cm = true
+        var nh = UInt32(numHeads)
+        var nkv = UInt32(numKVHeads)
+        var cap: Float = 0.0
+        var bs = UInt32(allocator.blockSize)
+        var mb = UInt32(maxBlocksPerSeq)
+        
+        enc.setBytes(&dh, length: MemoryLayout<UInt32>.size, index: 6)
+        enc.setBytes(&sc, length: MemoryLayout<Float>.size, index: 7)
+        enc.setBytes(&cm, length: MemoryLayout<Bool>.size, index: 8)
+        enc.setBytes(&nh, length: MemoryLayout<UInt32>.size, index: 9)
+        enc.setBytes(&nkv, length: MemoryLayout<UInt32>.size, index: 10)
+        enc.setBytes(&cap, length: MemoryLayout<Float>.size, index: 11)
+        enc.setBuffer(blockTables.buffer, offset: 0, index: 12)
+        enc.setBytes(&bs, length: MemoryLayout<UInt32>.size, index: 13)
+        enc.setBytes(&mb, length: MemoryLayout<UInt32>.size, index: 14)
+        
+        enc.dispatchThreads(MTLSize(width: totalTokens, height: 1, depth: numHeads),
+                            threadsPerThreadgroup: MTLSize(width: min(pso.maxTotalThreadsPerThreadgroup, totalTokens), height: 1, depth: 1))
+        
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        
+        // 4. Output projection
+        outputProj.forward(input: bConcatOut)
+        
+        // 5. Residual 1
+        dispatchAdd(a: input, b: outputProj.output, out: bResidual1, length: totalLen)
+        
+        // 6. FFN (Sub-block 2)
+        let bRmsOut2 = Tensor(device: engine.device, rows: totalTokens, cols: dModel)
+        memcpy(bRmsOut2.buffer.contents(), bResidual1.buffer.contents(), totalLen * MemoryLayout<Float>.stride)
+        dispatchRMSNorm(data: bRmsOut2, gamma: rmsGamma2, rows: totalTokens)
+        
+        gateProj.forward(input: bRmsOut2)
+        upProj.forward(input: bRmsOut2)
+        
+        dispatchSiLU(data: gateProj.output, length: totalTokens * ffnDim)
+        
+        let gPtr = gateProj.output.pointer()
+        let uPtr = upProj.output.pointer()
+        for i in 0..<(totalTokens * ffnDim) { gPtr[i] *= uPtr[i] }
+        
+        downProj.forward(input: gateProj.output)
+        
+        // Residual 2
+        dispatchAdd(a: bResidual1, b: downProj.output, out: bOutput, length: totalLen)
+        
+        return bOutput
+    }
+    
     /// Synchronize weights from prefill layers to decode layers (sharing memory).
     private func syncDecodeWeights() {
         if decodeWeightsSynced { return }

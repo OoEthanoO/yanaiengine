@@ -5,15 +5,13 @@ import NIOHTTP1
 /// An asynchronous HTTP server that exposes a Gemini-compatible API for YanAIEngine.
 public actor InferenceServer {
     private let model: LlamaModel
-    private let sampler: Sampler
-    private let engine: MetalEngine
+    private let scheduler: Scheduler
     private let tokenizer: Tokenizer?
     private let stopTokenId: UInt32
     
-    public init(model: LlamaModel, engine: MetalEngine, tokenizer: Tokenizer? = nil, stopTokenId: UInt32 = 128009) {
+    public init(model: LlamaModel, scheduler: Scheduler, tokenizer: Tokenizer? = nil, stopTokenId: UInt32 = 128009) {
         self.model = model
-        self.engine = engine
-        self.sampler = Sampler()
+        self.scheduler = scheduler
         self.tokenizer = tokenizer
         self.stopTokenId = stopTokenId
     }
@@ -86,12 +84,35 @@ public actor InferenceServer {
         let prompt = bridgeGeminiToLlama(request.contents)
         let config = request.generationConfig
         
-        // Update sampler settings
+        let maxTokens = config?.maxOutputTokens ?? 512
+        let sampler = Sampler()
         sampler.temperature = config?.temperature ?? 0.8
         sampler.topP = config?.topP ?? 0.9
         sampler.topK = config?.topK ?? 50
         
-        let generatedText = try await generate(prompt: prompt, maxTokens: config?.maxOutputTokens ?? 512)
+        // Wait for generation to complete
+        let generatedText = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            guard let tokens = tokenizer?.encode(text: prompt) else {
+                continuation.resume(throwing: NSError(domain: "Server", code: 1, userInfo: [NSLocalizedDescriptionKey: "Tokenization failed"]))
+                return
+            }
+            
+            var result = ""
+            let seq = SequenceRequest(
+                promptTokens: tokens,
+                numLayers: model.config.numLayers,
+                allocator: model.allocator,
+                sampler: sampler,
+                maxTokens: maxTokens,
+                stopTokenId: stopTokenId,
+                onTokenGenerated: { text in result += text },
+                onCompletion: { continuation.resume(returning: result) }
+            )
+            
+            Task {
+                await scheduler.submit(request: seq)
+            }
+        }
         
         return GeminiResponse(
             candidates: [
@@ -110,21 +131,32 @@ public actor InferenceServer {
         let config = request.generationConfig
         let maxTokens = config?.maxOutputTokens ?? 512
         
+        let sampler = Sampler()
+        sampler.temperature = config?.temperature ?? 0.8
+        sampler.topP = config?.topP ?? 0.9
+        sampler.topK = config?.topK ?? 50
+        
         return AsyncStream { continuation in
+            guard let tokens = tokenizer?.encode(text: prompt) else {
+                continuation.finish()
+                return
+            }
+            
+            // This is messy - we need to fix the allocator access.
+            // For now, assume model has access to allocator.
+            let seq = SequenceRequest(
+                promptTokens: tokens,
+                numLayers: model.config.numLayers,
+                allocator: model.allocator,
+                sampler: sampler,
+                maxTokens: maxTokens,
+                stopTokenId: stopTokenId,
+                onTokenGenerated: { text in continuation.yield(text) },
+                onCompletion: { continuation.finish() }
+            )
+            
             Task {
-                // Update sampler settings (accessing actor state safely because we are in the actor's Task)
-                self.sampler.temperature = config?.temperature ?? 0.8
-                self.sampler.topP = config?.topP ?? 0.9
-                self.sampler.topK = config?.topK ?? 50
-                
-                do {
-                    try await self.runGenerationStreaming(prompt: prompt, maxTokens: maxTokens) { tokenText in
-                        continuation.yield(tokenText)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish()
-                }
+                await scheduler.submit(request: seq)
             }
         }
     }

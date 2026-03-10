@@ -620,3 +620,118 @@ kernel void paged_fused_attention_kernel(
         head_O[i * dHead + d] = acc_row[d] / l_i;
     }
 }
+
+// Batched Paged Attention Kernel (Heterogeneous / Continuous Batching)
+// Handles multiple sequences (ragged batch) in a single kernel call.
+// q_starts: [batch_size + 1] cumulative start positions for Q tokens in the current batch.
+// context_lens: [batch_size] total tokens processed so far for each sequence.
+// block_tables: [batch_size][max_num_blocks_per_seq] flattened table mapping pages to blocks.
+kernel void batched_paged_attention_kernel(
+    device const float* Q [[buffer(0)]],
+    device const float* K_pool [[buffer(1)]],
+    device const float* V_pool [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    device const uint* q_starts [[buffer(4)]],
+    device const uint* context_lens [[buffer(5)]],
+    constant uint& dHead [[buffer(6)]],
+    constant float& scale [[buffer(7)]],
+    constant bool& causal [[buffer(8)]],
+    constant uint& nHeads [[buffer(9)]],
+    constant uint& nKVHeads [[buffer(10)]],
+    constant float& logit_cap [[buffer(11)]],
+    device const int* block_tables [[buffer(12)]],
+    constant uint& block_size [[buffer(13)]],
+    constant uint& max_blocks_per_seq [[buffer(14)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint head_id = gid.z;
+    uint global_q_idx = gid.x;
+    
+    // Find which sequence in the batch this Q token belongs to
+    uint seq_id = 0;
+    while (global_q_idx >= q_starts[seq_id + 1]) {
+        seq_id++;
+    }
+    
+    uint q_idx_in_seq = global_q_idx - q_starts[seq_id];
+    uint cur_context_len = context_lens[seq_id];
+    uint num_new_tokens = q_starts[seq_id + 1] - q_starts[seq_id];
+    uint logical_q_pos = (cur_context_len - num_new_tokens) + q_idx_in_seq;
+
+    uint kv_head_id = head_id / (nHeads / nKVHeads);
+    device const float* head_Q = Q + (global_q_idx * nHeads * dHead) + (head_id * dHead);
+    device float* head_O = O + (global_q_idx * nHeads * dHead) + (head_id * dHead);
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float acc_row[128];
+    for (uint d = 0; d < dHead; d++) acc_row[d] = 0.0f;
+
+    float q_row[128];
+    for (uint d = 0; d < dHead; d++) q_row[d] = head_Q[d];
+    
+    // RoPE for Q
+    for (uint p = 0; p < dHead / 2; p++) {
+        float theta = float(logical_q_pos) / pow(10000.0, float(2 * p) / float(dHead));
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        float q0 = q_row[2 * p];
+        float q1 = q_row[2 * p + 1];
+        q_row[2 * p] = q0 * cos_t - q1 * sin_t;
+        q_row[2 * p + 1] = q0 * sin_t + q1 * cos_t;
+    }
+
+    device const int* my_block_table = block_tables + (seq_id * max_blocks_per_seq);
+
+    // Loop over all historical tokens in this sequence
+    for (uint j = 0; j < cur_context_len; j++) {
+        if (causal && j > logical_q_pos) continue;
+
+        uint page_idx = j / block_size;
+        uint offset_in_block = j % block_size;
+        int physical_block_idx = my_block_table[page_idx];
+
+        uint block_stride = nKVHeads * block_size * dHead;
+        uint head_stride = block_size * dHead;
+        uint pool_offset = (physical_block_idx * block_stride) + (kv_head_id * head_stride) + (offset_in_block * dHead);
+
+        device const float* k_row_ptr = K_pool + pool_offset;
+        device const float* v_row_ptr = V_pool + pool_offset;
+
+        float k_row[128];
+        for (uint d = 0; d < dHead; d++) k_row[d] = k_row_ptr[d];
+        
+        // RoPE for K
+        for (uint p = 0; p < dHead / 2; p++) {
+            float theta = float(j) / pow(10000.0, float(2 * p) / float(dHead));
+            float cos_t = cos(theta);
+            float sin_t = sin(theta);
+            float k0 = k_row[2 * p];
+            float k1 = k_row[2 * p + 1];
+            k_row[2 * p] = k0 * cos_t - k1 * sin_t;
+            k_row[2 * p + 1] = k0 * sin_t + k1 * cos_t;
+        }
+
+        float s_ij = 0.0f;
+        for (uint d = 0; d < dHead; d++) s_ij += q_row[d] * k_row[d];
+        s_ij *= scale;
+
+        if (logit_cap > 0.0f) {
+            s_ij = logit_cap * tanh(s_ij / logit_cap);
+        }
+
+        float m_prev = m_i;
+        m_i = max(m_prev, s_ij);
+        float exp_val = exp(s_ij - m_i);
+        float p_scale = exp(m_prev - m_i);
+        
+        for (uint d = 0; d < dHead; d++) {
+            acc_row[d] = acc_row[d] * p_scale + exp_val * v_row_ptr[d];
+        }
+        l_i = l_i * p_scale + exp_val;
+    }
+
+    for (uint d = 0; d < dHead; d++) {
+        head_O[d] = acc_row[d] / l_i;
+    }
+}
