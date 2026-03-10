@@ -19,6 +19,30 @@ public class LMHead {
     /// Forward: project hidden states to logits [seqLen x vocabSize]
     public func forward(input: Tensor) {
         projection.forward(input: input)
+        applySoftCapping()
+    }
+    
+    /// Gemma 2: Apply logit soft-capping to the final vocab logits (cap=30.0)
+    private func applySoftCapping() {
+        guard let cb = engine.commandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { fatalError() }
+              
+        let pso = engine.getPipelineState(name: "logit_softcap_kernel")
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(projection.output.buffer, offset: 0, index: 0)
+        
+        var cap: Float = 30.0
+        var len = UInt32(projection.output.rows * projection.output.cols)
+        
+        enc.setBytes(&cap, length: MemoryLayout<Float>.size, index: 1)
+        enc.setBytes(&len, length: MemoryLayout<UInt32>.size, index: 2)
+        
+        enc.dispatchThreads(MTLSize(width: Int(len), height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(pso.maxTotalThreadsPerThreadgroup, Int(len)), height: 1, depth: 1))
+                            
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
     }
     
     /// Get the logits tensor (output of the projection)
@@ -41,7 +65,7 @@ public class LMHead {
                 maxIdx = UInt32(i)
             }
         }
-        
+    
         return maxIdx
     }
 }

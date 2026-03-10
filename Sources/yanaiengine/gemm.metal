@@ -186,6 +186,18 @@ kernel void softmax_kernel(
     }
 }
 
+// Logit Soft-Capping: capped_logits = cap * tanh(logits / cap)
+kernel void logit_softcap_kernel(
+    device float* data [[buffer(0)]],
+    constant float& cap [[buffer(1)]],
+    constant uint& length [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= length) return;
+    float x = data[gid];
+    data[gid] = cap * tanh(x / cap);
+}
+
 // Element-wise scale: data[i] = data[i] * scale_factor
 kernel void scale_kernel(
     device float* data [[buffer(0)]],
@@ -415,6 +427,8 @@ kernel void fused_attention_kernel(
     constant bool& causal [[buffer(7)]],
     constant uint& nHeads [[buffer(8)]],
     constant uint& nKVHeads [[buffer(9)]],
+    constant float& logit_cap [[buffer(10)]],
+    constant int& window_size [[buffer(11)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint head_id = gid.z;
@@ -457,8 +471,9 @@ kernel void fused_attention_kernel(
 
     // Outer loop over K/V keys (attending to all previous tokens)
     for (uint j = 0; j < seqLen; j++) {
-        // Apply causal mask
+        // Apply causal mask and sliding window
         if (causal && j > i) continue;
+        if (window_size > 0 && (int)i - (int)j >= window_size) continue;
 
         // Load K[j, :] and apply RoPE
         float k_row[128];
@@ -478,6 +493,11 @@ kernel void fused_attention_kernel(
         float s_ij = 0.0f;
         for (uint d = 0; d < dHead; d++) s_ij += q_row[d] * k_row[d];
         s_ij *= scale;
+
+        // Logit Soft-Capping (if cap > 0)
+        if (logit_cap > 0.0f) {
+            s_ij = logit_cap * tanh(s_ij / logit_cap);
+        }
 
         // Online Softmax update
         float m_prev = m_i;

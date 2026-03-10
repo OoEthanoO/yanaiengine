@@ -21,7 +21,8 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 - [x] **Goal #13: Full Model & Sampling**: Stacked LlamaModel, Temperature/Top-K/Top-P nucleus sampling, Llama 3 chat templates.
 - [x] **Goal #14: FlashAttention (Kernel Fusion)**: Smashed the "Memory Wall" with a fused kernel using Online Softmax and tiling to bypass VRAM bottlenecks.
 - [x] **Goal #15: Inference Server & Gemini API**: Turn the engine into a deployable microservice. Implements the Google Gemini API contract (`generateContent` + SSE Streaming) via Hummingbird 2.0.
-- [x] **Bare-Metal Kernels**: 20 hand-written MSL kernels including `gemm`, `q8_gemm`, `rope`, `rmsnorm`, `silu`, and the fused `fused_attention_kernel`.
+- [x] **Goal #16: Google Gemma 2 Architecture**: Polymorphic support for Google's **Logit Soft-Capping**, **GeGLU Activation**, and **Alternating Sliding Window Attention (SWA)**.
+- [x] **Bare-Metal Kernels**: 22 hand-written MSL kernels including `gemm`, `q8_gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, and the enhanced `fused_attention_kernel`.
 
 ## Architecture
 
@@ -30,7 +31,9 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
 | `LlamaBlock.swift` | Llama 3 block. Optimized for $O(1)$ inference with `forwardCached` and fused attention. |
-| `LlamaModel.swift` | Full orchestrator. Stacks N layers with per-layer `KVCache` and synchronized weight-sharing. |
+| `GemmaBlock.swift` | Google Gemma 2 block. Implements GeGLU, Logit Soft-Capping (50.0), and Sliding Window Attention. |
+| `GemmaModel.swift` | Gemma orchestrator. Alternates between Global Attention and SWA across even/odd layers. |
+| `LlamaModel.swift` | Llama orchestrator. Stacks N layers with per-layer `KVCache` and synchronized weight-sharing. |
 | `Sampler.swift` | Probabilistic decoding. Temperature, Top-K, Top-P (Nucleus) sampling. |
 | `MultiHeadAttention.swift` | **FlashAttention** powered. Single-pass GPU kernel for prefill with RoPE and Online Softmax. |
 | `KVCache.swift` | Inference optimizer. Per-head Key/Value buffers with position tracking for true autoregressive generation. |
@@ -41,6 +44,7 @@ Modern AI models live and die by their matrix operations. `YanAIEngine` focuses 
 | `Interconnect.swift` | The network layer. Asynchronous multi-node synchronization using **SwiftNIO**. |
 | `InferenceServer.swift` | The API layer. Asynchronous Hummingbird server exposing the **Gemini API** via SSE streaming. |
 | `GeminiSchema.swift` | The contract. `Codable` Swift structs mirroring Google's Gemini v1beta JSON schema. |
+| `KVCache.swift` | Enhanced buffer. Supports standard and **Sliding Window** mode via circular indexing. |
 
 ## Performance & Infrastructure
 

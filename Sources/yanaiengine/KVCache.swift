@@ -42,15 +42,19 @@ public class KVCache {
     
     /// Append K/V for all heads from full-width K and V tensors at a given row.
     /// K and V are [seqLen x dModel], we extract row `tokenIdx` and split across heads.
-    public func appendFromFull(kTensor: Tensor, vTensor: Tensor, tokenIdx: Int, dModel: Int) {
+    /// Supports sliding window via circular indexing.
+    public func appendFromFull(kTensor: Tensor, vTensor: Tensor, tokenIdx: Int, dModel: Int, windowSize: Int = 0) {
         let kPtr = kTensor.pointer()
         let vPtr = vTensor.pointer()
+        
+        // If windowSize > 0, we treat the cache as a circular buffer
+        let targetPos = (windowSize > 0) ? (currentPosition % windowSize) : currentPosition
         
         for h in 0..<numHeads {
             let headOffset = h * dHead
             let ckPtr = cachedKeys[h].pointer()
             let cvPtr = cachedValues[h].pointer()
-            let cacheOffset = currentPosition * dHead
+            let cacheOffset = targetPos * dHead
             
             for d in 0..<dHead {
                 ckPtr[cacheOffset + d] = kPtr[tokenIdx * dModel + headOffset + d]
