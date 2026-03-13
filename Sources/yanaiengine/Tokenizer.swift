@@ -2,7 +2,7 @@ import Foundation
 
 /// BPE (Byte-Pair Encoding) Tokenizer.
 /// Reads a HuggingFace `tokenizer.json` vocabulary and performs BPE encoding/decoding.
-public class Tokenizer {
+public class Tokenizer: @unchecked Sendable {
     
     /// Token string → ID
     public var vocab: [String: UInt32] = [:]

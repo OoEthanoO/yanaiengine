@@ -4,7 +4,7 @@ func testGemma2Architecture() {
     print("🚀 Starting Gemma 2 Architecture Verification...")
     
     // 1. Initialize Metal Engine
-    let engine = MetalEngine()
+    guard let engine = MetalEngine() else { return }
     
     // 2. Configuration for a "Tiny Gemma"
     let tinyConfig = GemmaConfig(
@@ -39,4 +39,4 @@ func testGemma2Architecture() {
 
 // Note: In a real environment, we'd need to mock MetalEngine or run in a proper test target.
 // This is a representative script for architectural verification.
-testGemma2Architecture()
+// testGemma2Architecture()

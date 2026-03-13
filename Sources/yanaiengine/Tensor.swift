@@ -17,16 +17,17 @@ public struct Tensor {
     public init(device: MTLDevice, rows: Int, cols: Int) {
         self.rows = rows
         self.cols = cols
-        
-        // We assume 32-bit floats for our basic GEMM operations
         let byteCount = rows * cols * MemoryLayout<Float>.stride
-        
-        // On UMA (Unified Memory Architecture) devices like Apple Silicon, 
-        // .storageModeShared allocates memory that both CPU and GPU can read/write directly.
         guard let buffer = device.makeBuffer(length: byteCount, options: .storageModeShared) else {
             fatalError("Failed to allocate an MTLBuffer of size \(byteCount)")
         }
         self.buffer = buffer
+    }
+    
+    public init(device: MTLDevice, rows: Int, cols: Int, existingBuffer: MTLBuffer) {
+        self.rows = rows
+        self.cols = cols
+        self.buffer = existingBuffer
     }
     
     /// Returns a typed pointer to the start of the buffer's contents, allowing CPU-side manipulation.

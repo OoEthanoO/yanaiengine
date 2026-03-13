@@ -43,6 +43,16 @@ public class LlamaBlock {
     public let output: Tensor
     private let concatOutput: Tensor
     
+    // Decode projections (sharing weights)
+    private var decodeWeightsSynced = false
+    private lazy var dQueryProj = LinearLayer(engine: engine, inputDim: dModel, outputDim: numHeads * dHead, batchSize: 1)
+    private lazy var dKeyProj = LinearLayer(engine: engine, inputDim: dModel, outputDim: numKVHeads * dHead, batchSize: 1)
+    private lazy var dValueProj = LinearLayer(engine: engine, inputDim: dModel, outputDim: numKVHeads * dHead, batchSize: 1)
+    private lazy var dOutputProj = LinearLayer(engine: engine, inputDim: numHeads * dHead, outputDim: dModel, batchSize: 1)
+    private lazy var dGateProj: LinearLayer? = (moe == nil) ? LinearLayer(engine: engine, inputDim: dModel, outputDim: ffnDim, batchSize: 1) : nil
+    private lazy var dUpProj: LinearLayer? = (moe == nil) ? LinearLayer(engine: engine, inputDim: dModel, outputDim: ffnDim, batchSize: 1) : nil
+    private lazy var dDownProj: LinearLayer? = (moe == nil) ? LinearLayer(engine: engine, inputDim: ffnDim, outputDim: dModel, batchSize: 1) : nil
+    
     public init(engine: MetalEngine, 
                 seqLen: Int, 
                 dModel: Int, 
@@ -245,19 +255,22 @@ public class LlamaBlock {
         memcpy(bRmsOut2.buffer.contents(), bResidual1.buffer.contents(), totalLen * MemoryLayout<Float>.stride)
         dispatchRMSNorm(data: bRmsOut2, gamma: rmsGamma2, rows: totalTokens)
         
-        gateProj.forward(input: bRmsOut2)
-        upProj.forward(input: bRmsOut2)
-        
-        dispatchSiLU(data: gateProj.output, length: totalTokens * ffnDim)
-        
-        let gPtr = gateProj.output.pointer()
-        let uPtr = upProj.output.pointer()
-        for i in 0..<(totalTokens * ffnDim) { gPtr[i] *= uPtr[i] }
-        
-        downProj.forward(input: gateProj.output)
+        let sub2Out: Tensor
+        if let moe = moe {
+            sub2Out = moe.forward(input: bRmsOut2)
+        } else {
+            gateProj!.forward(input: bRmsOut2)
+            upProj!.forward(input: bRmsOut2)
+            dispatchSiLU(data: gateProj!.output, length: totalTokens * ffnDim)
+            let gPtr = gateProj!.output.pointer()
+            let uPtr = upProj!.output.pointer()
+            for i in 0..<(totalTokens * ffnDim) { gPtr[i] *= uPtr[i] }
+            downProj!.forward(input: gateProj!.output)
+            sub2Out = downProj!.output
+        }
         
         // Residual 2
-        dispatchAdd(a: bResidual1, b: downProj.output, out: bOutput, length: totalLen)
+        dispatchAdd(a: bResidual1, b: sub2Out, out: bOutput, length: totalLen)
         
         return bOutput
     }
@@ -265,13 +278,24 @@ public class LlamaBlock {
     /// Synchronize weights from prefill layers to decode layers (sharing memory).
     private func syncDecodeWeights() {
         if decodeWeightsSynced { return }
-        let layers: [(LinearLayer, LinearLayer)] = [
-            (queryProj, dQueryProj), (keyProj, dKeyProj), (valueProj, dValueProj), (outputProj, dOutputProj),
-            (gateProj, dGateProj), (upProj, dUpProj), (downProj, dDownProj)
+        let coreLayers: [(LinearLayer, LinearLayer)] = [
+            (queryProj, dQueryProj), (keyProj, dKeyProj), (valueProj, dValueProj), (outputProj, dOutputProj)
         ]
-        for (src, dst) in layers {
+        for (src, dst) in coreLayers {
             memcpy(dst.weights.pointer(), src.weights.pointer(), src.weights.rows * src.weights.cols * MemoryLayout<Float>.stride)
             memcpy(dst.bias.pointer(), src.bias.pointer(), src.bias.cols * MemoryLayout<Float>.stride)
+        }
+        
+        if moe == nil {
+            let ffnLayers: [(LinearLayer?, LinearLayer?)] = [
+                (gateProj, dGateProj), (upProj, dUpProj), (downProj, dDownProj)
+            ]
+            for (src, dst) in ffnLayers {
+                if let s = src, let d = dst {
+                    memcpy(d.weights.pointer(), s.weights.pointer(), s.weights.rows * s.weights.cols * MemoryLayout<Float>.stride)
+                    memcpy(d.bias.pointer(), s.bias.pointer(), s.bias.cols * MemoryLayout<Float>.stride)
+                }
+            }
         }
         decodeWeightsSynced = true
     }
@@ -362,18 +386,27 @@ public class LlamaBlock {
         memcpy(rmsIn2.pointer(), x1.pointer(), dModel * MemoryLayout<Float>.stride)
         dispatchRMSNorm(data: rmsIn2, gamma: rmsGamma2, rows: 1)
         
-        dGateProj.forward(input: rmsIn2)
-        dUpProj.forward(input: rmsIn2)
+        let ffnRes: Tensor
+        if let moe = moe {
+            ffnRes = moe.forward(input: rmsIn2)
+        } else {
+            let dg = dGateProj!
+            let du = dUpProj!
+            let dd = dDownProj!
+            
+            dg.forward(input: rmsIn2)
+            du.forward(input: rmsIn2)
+            
+            dispatchSiLU(data: dg.output, length: ffnDim)
+            let gPtr = dg.output.pointer()
+            let uPtr = du.output.pointer()
+            for i in 0..<ffnDim { gPtr[i] *= uPtr[i] }
+            
+            dd.forward(input: dg.output)
+            ffnRes = dd.output
+        }
         
-        dispatchSiLU(data: dGateProj.output, length: ffnDim)
-        let gPtr = dGateProj.output.pointer()
-        let uPtr = dUpProj.output.pointer()
-        for i in 0..<ffnDim { gPtr[i] *= uPtr[i] }
-        
-        dDownProj.forward(input: dGateProj.output)
-        
-        // Residual 2
-        let resPtr = dDownProj.output.pointer()
+        let resPtr = ffnRes.pointer()
         let finalPtr = outSingle.pointer()
         for i in 0..<dModel { finalPtr[i] = x1Ptr[i] + resPtr[i] }
         

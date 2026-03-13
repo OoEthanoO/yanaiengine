@@ -39,9 +39,11 @@ struct yanaiengine {
             let mockTokenizer = Tokenizer()
             mockTokenizer.loadSimple(tokens: (0..<config.vocabSize).map { "\($0)" })
             
+            
             let server = InferenceServer(
                 model: model,
-                engine: engine,
+                draftModel: model, // Using the same tiny model as draft for testing
+                scheduler: Scheduler(model: model, draftModel: model, engine: engine, allocator: model.allocator, tokenizer: mockTokenizer),
                 tokenizer: mockTokenizer,
                 stopTokenId: 0 // Mock eot_id
             )

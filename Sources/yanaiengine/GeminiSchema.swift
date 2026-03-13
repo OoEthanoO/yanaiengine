@@ -14,7 +14,13 @@ public struct GeminiContent: Codable, Sendable {
 }
 
 public struct GeminiPart: Codable, Sendable {
-    public let text: String
+    public let text: String?
+    public let inlineData: GeminiInlineData?
+}
+
+public struct GeminiInlineData: Codable, Sendable {
+    public let mimeType: String
+    public let data: String // Base64
 }
 
 public struct GeminiGenerationConfig: Codable, Sendable {

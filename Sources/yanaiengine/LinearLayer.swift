@@ -26,12 +26,16 @@ public class LinearLayer {
     ///   - inputDim: The size of the input vector (cols of input / rows of weights).
     ///   - outputDim: The size of the output vector (cols of weights / cols of bias).
     ///   - batchSize: The number of rows in the input matrix.
-    public init(engine: MetalEngine, inputDim: Int, outputDim: Int, batchSize: Int, useReLU: Bool = true) {
+    public init(engine: MetalEngine, inputDim: Int, outputDim: Int, batchSize: Int, existingBuffer: MTLBuffer? = nil, useReLU: Bool = true) {
         self.engine = engine
         self.useReLU = useReLU
         
         // Weights: [inputDim x outputDim]
-        self.weights = Tensor(device: engine.device, rows: inputDim, cols: outputDim)
+        if let buffer = existingBuffer {
+             self.weights = Tensor(device: engine.device, rows: inputDim, cols: outputDim, existingBuffer: buffer)
+        } else {
+             self.weights = Tensor(device: engine.device, rows: inputDim, cols: outputDim)
+        }
         
         // Bias: [1 x outputDim] (broadcast across batchSize)
         self.bias = Tensor(device: engine.device, rows: 1, cols: outputDim)
@@ -51,8 +55,15 @@ public class LinearLayer {
         self.transposedWeights = Tensor(device: engine.device, rows: outputDim, cols: inputDim)
         
         // Initialize weights/bias with some values
-        weights.fillRandom()
+        if existingBuffer == nil {
+            weights.fillRandom()
+        }
         bias.fill(with: 0.1)
+    }
+    
+    /// Convenience initializer using rows/cols naming
+    public convenience init(engine: MetalEngine, rows: Int, cols: Int, batchSize: Int = 1, useReLU: Bool = true) {
+        self.init(engine: engine, inputDim: rows, outputDim: cols, batchSize: batchSize, useReLU: useReLU)
     }
     
     /// Performs the forward pass: ReLU(input * weights + bias)

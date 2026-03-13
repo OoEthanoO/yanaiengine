@@ -126,8 +126,8 @@ public class ModelLoader {
 extension Tensor {
     /// Returns a temporary LinearLayer-like object to use the loading logic.
     func rowAsLinear() -> LinearLayer {
-        // This is a hack for the loader, in reality we'd just load weights directly.
-        // For now, let's just use the direct loading logic in loadMoELayer.
-        return LinearLayer(engine: MetalEngine.shared, rows: self.rows, cols: self.cols, existingBuffer: self.buffer)
+        // This is a hack for the loader: it creates a "view" of the tensor as a LinearLayer
+        // so we can use loadLinearLayer on it.
+        return LinearLayer(engine: MetalEngine.shared, inputDim: self.rows, outputDim: self.cols, batchSize: 1, existingBuffer: self.buffer)
     }
 }

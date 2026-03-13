@@ -4,7 +4,7 @@ import Metal
 /// A Sparse Mixture of Experts (MoE) Layer.
 /// Replaces the standard Feed-Forward Network (FFN) with a collection of expert FFNs.
 public class MoELayer {
-    public let router: Router
+    public let router: MoERouter
     public let experts: [ExpertFFN]
     private let engine: MetalEngine
     private let numExperts: Int
@@ -19,7 +19,7 @@ public class MoELayer {
         self.numExperts = numExperts
         self.topK = topK
         
-        self.router = Router(engine: engine, dModel: dModel, numExperts: numExperts, topK: topK)
+        self.router = MoERouter(engine: engine, dModel: dModel, numExperts: numExperts, topK: topK)
         
         self.experts = (0..<numExperts).map { _ in
             ExpertFFN(engine: engine, dModel: dModel, ffnDim: ffnDim)

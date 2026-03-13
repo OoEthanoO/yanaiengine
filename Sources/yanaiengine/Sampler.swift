@@ -1,7 +1,7 @@
 import Foundation
 
 /// Advanced token sampler with Temperature, Top-K, and Top-P (Nucleus) sampling.
-public class Sampler {
+public class Sampler: @unchecked Sendable {
     public var temperature: Float
     public var topK: Int
     public var topP: Float

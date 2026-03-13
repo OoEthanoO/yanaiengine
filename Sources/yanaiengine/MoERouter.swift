@@ -3,7 +3,7 @@ import Metal
 
 /// The Gating Router for Mixture of Experts (MoE).
 /// Projects the hidden state to expert logits and selects Top-K experts.
-public class Router {
+public class MoERouter {
     public let weights: Tensor // [numExperts x dModel]
     private let engine: MetalEngine
     private let dModel: Int

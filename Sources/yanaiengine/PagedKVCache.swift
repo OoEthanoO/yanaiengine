@@ -61,6 +61,20 @@ public class PagedKVCache {
         currentPosition += 1
     }
     
+    /// Rollback the cache to a previous sequence position, freeing any orphaned blocks.
+    public func rollback(to position: Int) {
+        guard position <= currentPosition else { return }
+        
+        let neededBlocks = (position + blockSize - 1) / blockSize
+        
+        while pageTable.count > neededBlocks {
+            let removedBlock = pageTable.removeLast()
+            allocator.deallocate(blockIdx: removedBlock)
+        }
+        
+        currentPosition = position
+    }
+    
     /// Release all physical blocks back to the pool.
     public func reset() {
         for blockIdx in pageTable {

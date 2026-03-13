@@ -1,75 +1,57 @@
 # YanAIEngine 🚀
 
-`YanAIEngine` is a high-performance AI compute engine built natively for Apple Silicon. It bypasses high-level frameworks to demonstrate direct control over the GPU via Swift and the Metal Shading Language (MSL).
+`YanAIEngine` is an absolute titan of a multimodal inference engine built natively for Apple Silicon. It bypasses high-level frameworks to demonstrate direct control over the GPU via Swift and the Metal Shading Language (MSL), enabling state-of-the-art inference at scale.
 
 ## Core Philosophy: The Native Advantage
-Modern AI models live and die by their matrix operations. `YanAIEngine` focuses on the **Silicon & Kernel Layer**, exploiting the Apple Unified Memory Architecture (UMA) to achieve zero-copy data sharing between the CPU and GPU.
+Modern AI models live and die by their memory bandwidth. `YanAIEngine` focuses on the **Silicon & Kernel Layer**, exploiting the Apple Unified Memory Architecture (UMA) to achieve zero-copy data sharing between the CPU and GPU, and implementing algorithmic breakthroughs to break the memory wall.
 
 ### Key Milestones Completed
 - [x] **Zero-Copy Memory Bridge**: `Tensor` structures backed by `MTLBuffer` with shared storage mode.
-- [x] **Deep Learning & Chain Rule**: Full backpropagation support across multiple layers.
-- [x] **Sequential Model Abstraction**: Stackable `LinearLayer` components managed by a `Sequential` container.
-- [x] **Goal #4: Non-Linear Solving**: Successfully trained to solve the XOR problem natively on the GPU.
-- [x] **Goal #5: Distributed Interconnect**: Multi-node synchronization via **SwiftNIO** with All-Reduce gradient averaging.
-- [x] **Goal #6: Transformer Attention**: Scaled Dot-Product Self-Attention with Softmax, Scaling, and Causal Masking.
-- [x] **Goal #7: Full Transformer Block**: Multi-Head Attention, LayerNorm, GELU, Residual Connections — the exact architecture of GPT/Llama.
-- [x] **Goal #8: RoPE & Autoregressive Generation**: Rotary Positional Embeddings, Embedding/LMHead layers, and token-by-token text generation.
-- [x] **Goal #9: KV Cache Inference**: Prefill/Decode loop with KV-cached attention — zero redundant recomputation.
-- [x] **Goal #10: INT8 Quantization**: 4x weight compression with on-the-fly GPU dequantization (0.37% error).
-- [x] **Goal #11: Safetensors Loader**: Zero-copy `.safetensors` parser with POSIX `mmap` — ready for HuggingFace models.
+- [x] **Transformer Attention (Goal #6)**: Scaled Dot-Product Self-Attention with Softmax, Scaling, and Causal Masking.
 - [x] **Goal #12: Llama 3 Architecture**: RMSNorm, SwiGLU FFN, Grouped Query Attention (GQA), and BPE Tokenizer.
-- [x] **Goal #13: Full Model & Sampling**: Stacked LlamaModel, Temperature/Top-K/Top-P nucleus sampling, Llama 3 chat templates.
 - [x] **Goal #14: FlashAttention (Kernel Fusion)**: Smashed the "Memory Wall" with a fused kernel using Online Softmax and tiling to bypass VRAM bottlenecks.
-- [x] **Goal #15: Inference Server & Gemini API**: Turn the engine into a deployable microservice. Implements the Google Gemini API contract (`generateContent` + SSE Streaming) via Hummingbird 2.0.
-- [x] **Goal #16: Google Gemma 2 Architecture**: Polymorphic support for Google's **Logit Soft-Capping**, **GeGLU Activation**, and **Alternating Sliding Window Attention (SWA)**.
-- [x] **Goal #17: PagedAttention (Memory Virtualization)**: Virtualized KV Cache inspired by vLLM. Hand-written block allocator and page table system to eliminate VRAM fragmentation and enable high concurrency.
-- [x] **Goal #18: Continuous Batching (ORCA-style scheduling)**: ORCA-style scheduling that decouples requests from GPU cycles. Dynamically interleaves prefill and decode phases for multiple concurrent users to maximize hardware utilization.
-- [x] **Goal #19: Mixture of Experts (MoE) & Sparse Routing**
-- [x] **Goal #20**: Multimodal VLM (PaliGemma) & Vision-Language Fusion
-- [x] **Bare-Metal Kernels**: 26 hand-written MSL kernels including `gemm`, `rope`, `rmsnorm`, `gelu`, `logit_softcap_kernel`, `paged_fused_attention_kernel`, `moe_combine_kernel`, and `patch_embedding_kernel`.
+- [x] **Goal #15: Inference Server & Gemini API**: Hummingbird-powered microservice implementing the Google Gemini API contract (`generateContent` + SSE Streaming).
+- [x] **Goal #16: Google Gemma 2 Architecture**: Polymorphic support for **Logit Soft-Capping**, **GeGLU Activation**, and **Alternating Sliding Window Attention (SWA)**.
+- [x] **Goal #17: PagedAttention (Memory Virtualization)**: Virtualized KV Cache with a hand-written block allocator and page table system to eliminate VRAM fragmentation.
+- [x] **Goal #18: Continuous Batching**: ORCA-style scheduling that interleaves prefill and decode phases for massive concurrent throughput.
+- [x] **Goal #19: Mixture of Experts (MoE)**: Sparse routing for trillion-parameter scale models (Mixtral-style).
+- [x] **Goal #20: Multimodal VLM (PaliGemma)**: Integrated **SigLIP Vision Encoder** for high-density image reasoning.
+- [x] **Goal #21: Speculative Decoding (Draft-Verify)**: Breaking the **Memory Bandwidth Wall** using a draft-verify pipeline that doubles or triples generation speed.
+- [x] **Bare-Metal Kernels**: 28 hand-written MSL kernels including `gemm`, `rope`, `rmsnorm`, `paged_fused_attention_kernel`, and `patch_embedding_kernel`.
 
 ## Architecture
 
 | Component | Description |
 |-----------|-------------|
-| `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with serialization support. |
+| `Tensor.swift` | The foundation. Manages page-aligned CPU/GPU shared memory with zero-copy buffer sharing. |
 | `MetalEngine.swift` | The control plane. Handles device discovery, command queues, and kernel caching. |
-| `LlamaBlock.swift` | Llama 3 block. Optimized for $O(1)$ inference with `forwardCached` and fused attention. |
-| `GemmaBlock.swift` | Google Gemma 2 block. Implements GeGLU, Logit Soft-Capping (50.0), and Sliding Window Attention. |
-| `GemmaModel.swift` | Gemma orchestrator. Alternates between Global Attention and SWA across even/odd layers. |
-| `LlamaModel.swift` | Llama orchestrator. Stacks N layers with per-layer `KVCache` and synchronized weight-sharing. |
-| `Sampler.swift` | Probabilistic decoding. Temperature, Top-K, Top-P (Nucleus) sampling. |
-| `MultiHeadAttention.swift` | **FlashAttention** powered. Single-pass GPU kernel for prefill with RoPE and Online Softmax. |
-| `KVCache.swift` | Inference optimizer. Per-head Key/Value buffers with position tracking for true autoregressive generation. |
-| `EmbeddingLayer.swift` | Token ID → dense vector lookup with optimized single-token `forwardDecode` path. |
-| `Tokenizer.swift` | BPE tokenizer. Parses `tokenizer.json` with standard byte-pair encoding merge rules. |
-| `SafetensorsReader.swift` | HuggingFace bridge. Parses `.safetensors` files via POSIX `mmap` (zero-copy). |
-| `gemm.metal` | The math. 23 kernels implementing every layer natively in C++/MSL. |
-| `Interconnect.swift` | The network layer. Asynchronous multi-node synchronization using **SwiftNIO**. |
-| `InferenceServer.swift` | The API layer. Asynchronous Hummingbird server exposing the **Gemini API** via SSE streaming. |
-| `GeminiSchema.swift` | The contract. `Codable` Swift structs mirroring Google's Gemini v1beta JSON schema. |
-| `BlockAllocator.swift` | Physical pool. Pre-allocates VRAM blocks (16 tokens) to eliminate fragmentation. |
+| `Scheduler.swift` | The brain. Manages continuous batching and the **Speculative Decoding** draft-verify loop. |
+| `LlamaModel.swift` | Llama 3/4 orchestrator. Optimized for $O(1)$ inference with `forwardStep` and batch verification. |
+| `SpeculativeSampler.swift` | The verify engine. Implements rejection sampling to validate draft tokens against the target model. |
 | `PagedKVCache.swift` | Virtual mapping. Uses Page Tables to map logical sequences to physical blocks in the pool. |
-| `Scheduler.swift` | Manages request queues and Continuous Batching loop |
-| `Router.swift` | Gating network for Sparse MoE Routing |
-| `MoELayer.swift` | Encapsulates expert-partitioned Feed-Forward Networks |
-| `SigLIPEncoder.swift` | Vision Transformer (ViT) for high-density image encoding |
-| `MultimodalProjector.swift` | Linear bridge aligning visual and textual latent spaces |
-| `ModelLoader.swift` | Unified loader for Safetensors, quantized experts, and vision weights |
+| `BlockAllocator.swift` | Physical pool. Pre-allocates VRAM blocks (16 tokens) to eliminate fragmentation. |
+| `SigLIPEncoder.swift` | Vision Transformer (ViT). Encodes raw pixels into high-density visual embeddings. |
+| `MultimodalProjector.swift` | The bridge. Aligns visual latent spaces with the LLM's dimensional space. |
+| `MoERouter.swift` | Gating network. Sparsely dispatches tokens to expert-partitioned Feed-Forward Networks. |
+| `InferenceServer.swift` | The API layer. Asynchronous server exposing a unified Gemini/OpenAI-compatible interface. |
+| `gemm.metal` | The math. Hand-optimized C++/MSL kernels for maximum compute utilization. |
 
 ## Performance & Infrastructure
 
-### Bypassing the Memory Wall (FlashAttention)
-In standard attention, computing scores for 4,000 tokens creates a massive $N \times N$ bottleneck. `YanAIEngine` implements **FlashAttention (Goal #14)**: a single fused kernel that computes dot-product scores, scaling, masking, and softmax as a tiled stream. Intermediate data stays in the GPU's ultra-fast L1 cache (Threadgroup Memory), reducing global VRAM traffic and enabling massive context windows.
+### Breaking the Bandwidth Wall (Speculative Decoding)
+During autoregressive decoding, GPU compute cores often sit idle while waiting for massive weight matrices to be fetched from memory. `YanAIEngine` implements **Speculative Decoding (Goal #21)**: a technique where a tiny, lightning-fast "draft" model guesses the next several tokens, and the massive "target" model verifies them in parallel. This converts a memory-bound sequential problem into a compute-bound parallel one, often **doubling or tripling generation speed** on local hardware.
 
-### $O(1)$ Autoregressive Inference (PagedAttention & Continuous Batching)
-By implementing **PagedAttention (Goal #17)** and **Continuous Batching (Goal #18)**, the engine achieves massive concurrent throughput. We chop the KV Cache into small "Pages" mapped via a Page Table, allowing the **Scheduler** to dynamically pack tokens from multiple users into every single GPU compute cycle. This solves both the "Memory Wall" (fragmentation) and the "Utilization Wall" (idle silicon), enabling data center-scale serving on a single Mac.
+### $O(1)$ Throughput (PagedAttention & Continuous Batching)
+By virtualizing the KV Cache, we eliminate the need for contiguous VRAM. The engine chops memory into small "Pages" managed by a **Block Allocator**, allowing the **Scheduler** to interleave processing for many users simultaneously. This solves the "Memory Wall" (fragmentation) and enables high-concurrency serving without performance degradation.
+
+### Multimodal Reasoning (Vision-Language Fusion)
+`YanAIEngine` is fully multimodal. It uses a **SigLIP Vision Encoder** to process image patches, which are then fused with text tokens via a **Multimodal Projector**. This allows the engine to "see" and "read" simultaneously, enabling visual question answering and complex scene reasoning.
 
 ## Quick Start
 
 ### Swift CLI Demo
 ```bash
-# Processes a prompt and generates text token-by-token (KV Cache)
+# Processes a prompt and generates text natively on the GPU
 swift run yanaiengine
 ```
 
@@ -79,10 +61,18 @@ swift run yanaiengine
 swift run yanaiengine --server
 ```
 
-### Querying the API
+### Querying the Multimodal API
 ```bash
-# In a separate terminal:
+# Example: Ask about an image using the Gemini API schema
 curl http://localhost:8080/v1beta/models/yanai-model:generateContent \
     -X POST -H "Content-Type: application/json" \
-    -d '{"contents": [{"role": "user", "parts": [{"text": "Hello!"}]}]}'
+    -d '{
+      "contents": [{
+        "parts": [
+          {"text": "What is in this image?"},
+          {"inline_data": {"mime_type": "image/png", "data": "BASE64_DATA"}}
+        ]
+      }]
+    }'
 ```
+

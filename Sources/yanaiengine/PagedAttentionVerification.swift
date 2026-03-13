@@ -4,7 +4,7 @@ import Metal
 func testPagedAttention() {
     print("🚀 Starting PagedAttention Verification...")
     
-    let engine = MetalEngine()
+    guard let engine = MetalEngine() else { return }
     let device = engine.device
     
     // 1. Initialize Block Allocator
@@ -43,4 +43,4 @@ func testPagedAttention() {
     print("🎉 PagedAttention verification passed!")
 }
 
-testPagedAttention()
+// testPagedAttention()

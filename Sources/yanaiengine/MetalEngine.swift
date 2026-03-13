@@ -2,7 +2,8 @@ import Metal
 import Foundation
 
 /// Handles the Metal initialization (GPU Handshake)
-public class MetalEngine {
+public class MetalEngine: @unchecked Sendable {
+    public static let shared = MetalEngine()!
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
     private var pipelineStates: [String: MTLComputePipelineState] = [:]

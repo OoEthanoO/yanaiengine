@@ -3,7 +3,7 @@ import Foundation
 
 /// Full Llama model: Embedding → N × LlamaBlock → RMSNorm → LMHead.
 /// Each LlamaBlock has its own KVCache for efficient autoregressive decode.
-public class LlamaModel {
+public class LlamaModel: @unchecked Sendable {
     private let engine: MetalEngine
     public let config: LlamaConfig
     
@@ -129,9 +129,9 @@ public class LlamaModel {
         return decodeLmHead.logits.pointer()
     }
     
-    /// Performs one forward step for a batch of sequences (Continuous Batching).
-    /// Returns an array of pointers to the logits of the last token for each sequence.
-    public func forwardStep(batch: [SequenceRequest], allocator: BlockAllocator) -> [UnsafeMutablePointer<Float>] {
+    /// Performs one forward step for a batch of sequences.
+    /// Returns an array of pointer arrays (one pointer for each token processed for each sequence).
+    public func forwardStep(batch: [SequenceRequest], allocator: BlockAllocator, isDraft: Bool = false) -> [[UnsafeMutablePointer<Float>]] {
         let batchSize = batch.count
         var totalTokens = 0
         var qStarts: [UInt32] = [0]
@@ -141,7 +141,7 @@ public class LlamaModel {
         // 1. Prepare Metadata & Concatenate Inputs
         var maxBlocks = 0
         for req in batch {
-            let nextTokens = req.getNextInput()
+            let nextTokens = req.getNextInput(isDraft: isDraft)
             allInputTokens.append(contentsOf: nextTokens)
             totalTokens += nextTokens.count
             qStarts.append(UInt32(totalTokens))
@@ -155,7 +155,7 @@ public class LlamaModel {
         let blockTablesTensor = Tensor(device: engine.device, rows: batchSize, cols: maxBlocks)
         let btPtr = blockTablesTensor.buffer.contents().bindMemory(to: Int32.self, capacity: batchSize * maxBlocks)
         for i in 0..<batchSize {
-            let table = batch[i].pagedKVCache[0].pageTable // Blocks are shared across layers for same seq
+            let table = isDraft ? batch[i].draftKVCache![0].pageTable : batch[i].pagedKVCache[0].pageTable
             for j in 0..<table.count {
                 btPtr[i * maxBlocks + j] = Int32(table[j])
             }
@@ -199,8 +199,9 @@ public class LlamaModel {
                     batchOffset += prevVision + prevText
                 }
                 
+                let pagedCache = isDraft ? req.draftKVCache![layerIdx] : req.pagedKVCache[layerIdx]
                 for t in 0..<numTotalNew {
-                    req.pagedKVCache[layerIdx].appendFromFull(
+                    pagedCache.appendFromFull(
                         kTensor: kLayer,
                         vTensor: vLayer,
                         tokenIdx: batchOffset + t
@@ -227,11 +228,16 @@ public class LlamaModel {
         lmHead.forward(input: current)
         let allLogits = lmHead.logits.pointer()
         
-        // 7. Extract last-token logits for each request
-        var resultPointers: [UnsafeMutablePointer<Float>] = []
+        // 7. Extract logits for each token processed in this step
+        var resultPointers: [[UnsafeMutablePointer<Float>]] = []
         for i in 0..<batchSize {
-            let lastTokenGlobalIdx = Int(qStarts[i + 1]) - 1
-            resultPointers.append(allLogits + (lastTokenGlobalIdx * config.vocabSize))
+            var seqPointers: [UnsafeMutablePointer<Float>] = []
+            let startIdx = Int(qStarts[i])
+            let endIdx = Int(qStarts[i + 1])
+            for t in startIdx..<endIdx {
+                seqPointers.append(allLogits + (t * config.vocabSize))
+            }
+            resultPointers.append(seqPointers)
         }
         
         return resultPointers
@@ -327,6 +333,13 @@ public struct LlamaConfig: Sendable {
         ffnMultiplier: 2.6875
     )
     
+    public init(vocabSize: Int, dModel: Int, numHeads: Int, numKVHeads: Int, numLayers: Int, maxSeqLen: Int, ffnMultiplier: Float, numExperts: Int? = nil, numExpertsPerToken: Int? = nil) {
+        self.vocabSize = vocabSize
+        self.dModel = dModel
+        self.numHeads = numHeads
+        self.numKVHeads = numKVHeads
+        self.numLayers = numLayers
+        self.maxSeqLen = maxSeqLen
         self.ffnMultiplier = ffnMultiplier
         self.numExperts = numExperts
         self.numExpertsPerToken = numExpertsPerToken

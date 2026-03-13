@@ -6,7 +6,8 @@ public class SequenceRequest: Identifiable {
     public let id: UUID = UUID()
     public var promptTokens: [UInt32]
     public var generatedTokens: [UInt32] = []
-    public let pagedKVCache: [PagedKVCache] // One per layer
+    public let pagedKVCache: [PagedKVCache] // Target model cache
+    public let draftKVCache: [PagedKVCache]? // Draft model cache
     public let sampler: Sampler
     public let maxTokens: Int
     public let stopTokenId: UInt32
@@ -29,6 +30,8 @@ public class SequenceRequest: Identifiable {
     public init(promptTokens: [UInt32], 
                 numLayers: Int, 
                 allocator: BlockAllocator,
+                draftNumLayers: Int? = nil,
+                draftAllocator: BlockAllocator? = nil,
                 sampler: Sampler,
                 maxTokens: Int, 
                 stopTokenId: UInt32,
@@ -47,16 +50,31 @@ public class SequenceRequest: Identifiable {
         self.pagedKVCache = (0..<numLayers).map { _ in
             PagedKVCache(allocator: allocator)
         }
+        
+        if let draftNumLayers = draftNumLayers, let draftAllocator = draftAllocator {
+            self.draftKVCache = (0..<draftNumLayers).map { _ in
+                PagedKVCache(allocator: draftAllocator)
+            }
+        } else {
+            self.draftKVCache = nil
+        }
     }
     
+    public var pendingTokensForTarget: [UInt32] = []
+    
     /// Returns the input token(s) for the next forward pass.
-    /// If prefill is not done, returns all prompt tokens.
-    /// Otherwise returns the last generated token.
-    public func getNextInput() -> [UInt32] {
+    public func getNextInput(isDraft: Bool) -> [UInt32] {
         if !isPrefillDone {
             return promptTokens
         } else {
-            return [generatedTokens.last ?? promptTokens.last!]
+            if isDraft {
+                // Draft model just needs the last generated token
+                return [generatedTokens.last ?? promptTokens.last!]
+            } else {
+                // Target model needs all pending drafted tokens (or just the last generated if not speculative)
+                let tokens = pendingTokensForTarget.isEmpty ? [generatedTokens.last ?? promptTokens.last!] : pendingTokensForTarget
+                return tokens
+            }
         }
     }
 }
@@ -64,6 +82,7 @@ public class SequenceRequest: Identifiable {
 /// The Continuous Batching Scheduler (ORCA-style).
 /// Orchestrates the execution loop and manages multiple sequences simultaneously.
 public actor Scheduler {
+    private let draftModel: LlamaModel?
     private let model: LlamaModel
     private let engine: MetalEngine
     private let allocator: BlockAllocator
@@ -74,7 +93,8 @@ public actor Scheduler {
     
     private var isLoopRunning: Bool = false
     
-    public init(model: LlamaModel, engine: MetalEngine, allocator: BlockAllocator, tokenizer: Tokenizer?) {
+    public init(model: LlamaModel, draftModel: LlamaModel? = nil, engine: MetalEngine, allocator: BlockAllocator, tokenizer: Tokenizer?) {
+        self.draftModel = draftModel
         self.model = model
         self.engine = engine
         self.allocator = allocator
@@ -100,7 +120,6 @@ public actor Scheduler {
         while !waitingQueue.isEmpty || !runningQueue.isEmpty {
             // 1. Scheduling: Move waiting requests to running queue if memory allows
             while !waitingQueue.isEmpty {
-                let req = waitingQueue[0]
                 // Simple heuristic: check if we have some blocks free (at least for initial prefill)
                 if allocator.usage < 0.9 {
                     runningQueue.append(waitingQueue.removeFirst())
@@ -134,33 +153,142 @@ public actor Scheduler {
     
     /// Performs a single heterogeneous forward pass on the GPU.
     private func step() {
-        // Collect batch of sequences
         let batch = runningQueue
+        if batch.isEmpty { return }
         
-        // Orchestrate batch forward pass
-        let allLogitsPointers = model.forwardStep(batch: batch, allocator: allocator)
+        let isSpeculative = draftModel != nil
         
-        for i in 0..<batch.count {
-            let req = batch[i]
-            let logits = allLogitsPointers[i]
+        if isSpeculative, let draftModel = draftModel {
+            let gamma = 4
             
-            // Sample
-            var logitsCopy = [Float](repeating: 0, count: model.config.vocabSize)
-            for j in 0..<model.config.vocabSize { logitsCopy[j] = logits[j] }
-            let nextToken = req.sampler.sample(logits: &logitsCopy, vocabSize: model.config.vocabSize)
+            // Per-sequence state
+            var draftTokens: [[UInt32]] = Array(repeating: [], count: batch.count)
+            var draftProbs: [[[Float]]] = Array(repeating: [], count: batch.count)
+            let targetCachePositions: [Int] = batch.map { $0.pagedKVCache[0].currentPosition }
+            let wasPrefillDone: [Bool] = batch.map { $0.isPrefillDone }
             
-            req.generatedTokens.append(nextToken)
+            // 1. DRAFT PHASE
+            for _ in 0..<gamma {
+                let allDraftLogits = draftModel.forwardStep(batch: batch, allocator: draftModel.allocator, isDraft: true)
+                for i in 0..<batch.count {
+                    let req = batch[i]
+                    if req.isFinished { continue }
+                    
+                    let tokenLogitsPtr = allDraftLogits[i].last!
+                    var logitsCopy = [Float](repeating: 0, count: model.config.vocabSize)
+                    for j in 0..<model.config.vocabSize { logitsCopy[j] = tokenLogitsPtr[j] }
+                    
+                    let probs = SpeculativeSampler.softmax(logits: logitsCopy)
+                    let token = SpeculativeSampler.sampleFromProbs(probs)
+                    
+                    draftTokens[i].append(token)
+                    draftProbs[i].append(probs)
+                    
+                    req.generatedTokens.append(token)
+                    req.isPrefillDone = true
+                }
+            }
             
-            // Output handling
-            let text = tokenizer?.decode(ids: [nextToken]) ?? ""
-            req.onTokenGenerated(text)
+            // 2. VERIFICATION SETUP
+            for i in 0..<batch.count {
+                let req = batch[i]
+                if req.isFinished { continue }
+                
+                let originalPrefillDone = wasPrefillDone[i]
+                req.generatedTokens.removeLast(draftTokens[i].count)
+                req.isPrefillDone = originalPrefillDone 
+                
+                if !req.isPrefillDone {
+                    req.pendingTokensForTarget = req.promptTokens + draftTokens[i]
+                } else {
+                    let lastVerified = req.generatedTokens.last ?? req.promptTokens.last!
+                    req.pendingTokensForTarget = [lastVerified] + draftTokens[i]
+                }
+            }
             
-            // State update
-            req.isPrefillDone = true
+            // 3. TARGET MODEL PARALLEL FORWARD
+            let allTargetLogits = model.forwardStep(batch: batch, allocator: allocator, isDraft: false)
             
-            // Completion check
-            if nextToken == req.stopTokenId || req.generatedTokens.count >= req.maxTokens {
-                req.isFinished = true
+            // 4. VERIFICATION & ROLLBACK
+            for i in 0..<batch.count {
+                let req = batch[i]
+                if req.isFinished { continue }
+                
+                req.isPrefillDone = true
+                req.pendingTokensForTarget = []
+                
+                let targetLogitsPtrs = allTargetLogits[i]
+                let numDrafted = draftTokens[i].count
+                let numOutputLogits = targetLogitsPtrs.count
+                var targetLogitsArray: [[Float]] = []
+                
+                let startIndexLogits = max(0, numOutputLogits - numDrafted - 1)
+                
+                for ptrIdx in startIndexLogits..<numOutputLogits {
+                    let ptr = targetLogitsPtrs[ptrIdx]
+                    var logitsCopy = [Float](repeating: 0, count: model.config.vocabSize)
+                    for j in 0..<model.config.vocabSize { logitsCopy[j] = ptr[j] }
+                    targetLogitsArray.append(logitsCopy)
+                }
+                
+                let acceptedSequence = SpeculativeSampler.verifySequence(
+                    draftedTokens: draftTokens[i],
+                    draftProbs: draftProbs[i],
+                    targetLogits: targetLogitsArray,
+                    vocabSize: model.config.vocabSize
+                )
+                
+                // Rollback caches
+                let finalLen = targetCachePositions[i] + acceptedSequence.count - 1
+                for layerIdx in 0..<model.config.numLayers {
+                    req.pagedKVCache[layerIdx].rollback(to: finalLen)
+                }
+                
+                if let draftCaches = req.draftKVCache {
+                    for layerIdx in 0..<draftModel.config.numLayers {
+                        draftCaches[layerIdx].rollback(to: finalLen)
+                    }
+                }
+                
+                req.generatedTokens.append(contentsOf: acceptedSequence)
+                
+                for t in acceptedSequence {
+                    let text = tokenizer?.decode(ids: [t]) ?? ""
+                    req.onTokenGenerated(text)
+                    if t == req.stopTokenId {
+                        req.isFinished = true
+                        break
+                    }
+                }
+                
+                if req.generatedTokens.count >= req.maxTokens {
+                    req.isFinished = true
+                }
+            }
+            
+        } else {
+            // Standard Autoregressive Decode
+            let allLogitsPointers = model.forwardStep(batch: batch, allocator: allocator, isDraft: false)
+            
+            for i in 0..<batch.count {
+                let req = batch[i]
+                let logitsPtrs = allLogitsPointers[i]
+                if logitsPtrs.isEmpty { continue }
+                let logits = logitsPtrs.last!
+                
+                var logitsCopy = [Float](repeating: 0, count: model.config.vocabSize)
+                for j in 0..<model.config.vocabSize { logitsCopy[j] = logits[j] }
+                let nextToken = req.sampler.sample(logits: &logitsCopy, vocabSize: model.config.vocabSize)
+                
+                req.generatedTokens.append(nextToken)
+                let text = tokenizer?.decode(ids: [nextToken]) ?? ""
+                req.onTokenGenerated(text)
+                
+                req.isPrefillDone = true
+                
+                if nextToken == req.stopTokenId || req.generatedTokens.count >= req.maxTokens {
+                    req.isFinished = true
+                }
             }
         }
     }

@@ -3,7 +3,7 @@ import Foundation
 
 /// A global physical memory manager for KV Cache blocks.
 /// Inspired by vLLM, it pre-allocates a massive memory pool and manages it in fixed-size blocks.
-public class BlockAllocator {
+public class BlockAllocator: @unchecked Sendable {
     private let device: MTLDevice
     public let blockSize: Int        // Tokens per block (e.g., 16)
     public let numBlocks: Int       // Total number of blocks in the pool

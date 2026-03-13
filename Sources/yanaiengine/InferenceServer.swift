@@ -4,6 +4,7 @@ import NIOHTTP1
 
 /// An asynchronous HTTP server that exposes a Gemini-compatible API for YanAIEngine.
 public actor InferenceServer {
+    private let draftModel: LlamaModel?
     private let model: LlamaModel
     private let scheduler: Scheduler
     private let tokenizer: Tokenizer?
@@ -13,7 +14,8 @@ public actor InferenceServer {
     private let visionEncoder: SigLIPEncoder
     private let projector: MultimodalProjector
     
-    public init(model: LlamaModel, scheduler: Scheduler, tokenizer: Tokenizer? = nil, stopTokenId: UInt32 = 128009) {
+    public init(model: LlamaModel, draftModel: LlamaModel? = nil, scheduler: Scheduler, tokenizer: Tokenizer? = nil, stopTokenId: UInt32 = 128009) {
+        self.draftModel = draftModel
         self.model = model
         self.scheduler = scheduler
         self.tokenizer = tokenizer
@@ -55,7 +57,7 @@ public actor InferenceServer {
                         let chunk = GeminiStreamChunk(
                             candidates: [
                                 GeminiCandidate(
-                                    content: GeminiContent(role: "model", parts: [GeminiPart(text: tokenText)]),
+                                    content: GeminiContent(role: "model", parts: [GeminiPart(text: tokenText, inlineData: nil)]),
                                     finishReason: nil,
                                     avgLogprobs: nil
                                 )
@@ -115,6 +117,8 @@ public actor InferenceServer {
                 promptTokens: tokens,
                 numLayers: model.config.numLayers,
                 allocator: model.allocator,
+                draftNumLayers: draftModel?.config.numLayers,
+                draftAllocator: draftModel?.allocator,
                 sampler: sampler,
                 maxTokens: maxTokens,
                 stopTokenId: stopTokenId,
@@ -131,7 +135,7 @@ public actor InferenceServer {
         return GeminiResponse(
             candidates: [
                 GeminiCandidate(
-                    content: GeminiContent(role: "model", parts: [GeminiPart(text: generatedText)]),
+                    content: GeminiContent(role: "model", parts: [GeminiPart(text: generatedText, inlineData: nil)]),
                     finishReason: "STOP",
                     avgLogprobs: nil
                 )
@@ -168,6 +172,8 @@ public actor InferenceServer {
                 promptTokens: tokens,
                 numLayers: model.config.numLayers,
                 allocator: model.allocator,
+                draftNumLayers: draftModel?.config.numLayers,
+                draftAllocator: draftModel?.allocator,
                 sampler: sampler,
                 maxTokens: maxTokens,
                 stopTokenId: stopTokenId,
@@ -189,8 +195,9 @@ public actor InferenceServer {
         var prompt = "<|begin_of_text|>"
         for content in contents {
             let role = content.role ?? "user"
-            let text = content.parts.map { $0.text }.joined(separator: "\n")
+            let text = content.parts.compactMap { $0.text }.joined(separator: "\n")
             prompt += "<|start_header_id|>\(role)<|end_header_id|>\n\n\(text)<|eot_id|>"
+        }
         return prompt
     }
     
@@ -209,6 +216,7 @@ public actor InferenceServer {
     
     /// Core generation loop (serial execution on the GPU).
     private func generate(prompt: String, maxTokens: Int) async throws -> String {
+        let sampler = Sampler()
         // Since this is an actor, this whole method is serial.
         // We'll use the existing LlamaModel & Sampler logic.
         
@@ -245,6 +253,7 @@ public actor InferenceServer {
     }
     
     private func runGenerationStreaming(prompt: String, maxTokens: Int, callback: @Sendable (String) async throws -> Void) async throws {
+        let sampler = Sampler()
         guard let tokens = tokenizer?.encode(text: prompt) else { return }
         
         model.resetCaches()

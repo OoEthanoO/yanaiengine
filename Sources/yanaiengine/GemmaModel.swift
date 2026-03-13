@@ -95,7 +95,7 @@ public class GemmaModel {
     }
 }
 
-public struct GemmaConfig {
+public struct GemmaConfig: Sendable {
     public let vocabSize: Int
     public let dModel: Int
     public let numHeads: Int

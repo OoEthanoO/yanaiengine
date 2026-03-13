@@ -21,15 +21,20 @@ public class SigLIPEncoder {
     public init(engine: MetalEngine) {
         self.engine = engine
         
+        let dEmbedLocal = 1152
+        let numHeadsLocal = 16
+        let numLayersLocal = 27
+        let patchSizeLocal = 14
+        
         // Initialize weights (placeholders)
-        self.patchWeights = Tensor(device: engine.device, rows: dEmbed, cols: 3 * patchSize * patchSize)
-        self.patchBias = Tensor(device: engine.device, rows: 1, cols: dEmbed)
+        self.patchWeights = Tensor(device: engine.device, rows: dEmbedLocal, cols: 3 * patchSizeLocal * patchSizeLocal)
+        self.patchBias = Tensor(device: engine.device, rows: 1, cols: dEmbedLocal)
         
-        let numPatches = (224 / patchSize) * (224 / patchSize)
-        self.posEmbed = Tensor(device: engine.device, rows: numPatches, cols: dEmbed)
+        let numPatches = (224 / patchSizeLocal) * (224 / patchSizeLocal)
+        self.posEmbed = Tensor(device: engine.device, rows: numPatches, cols: dEmbedLocal)
         
-        self.blocks = (0..<numLayers).map { _ in
-            ViTBlock(engine: engine, dModel: dEmbed, numHeads: numHeads)
+        self.blocks = (0..<numLayersLocal).map { _ in
+            ViTBlock(engine: engine, dModel: dEmbedLocal, numHeads: numHeadsLocal)
         }
     }
     
@@ -119,9 +124,10 @@ public class ViTBlock {
     public init(engine: MetalEngine, dModel: Int, numHeads: Int) {
         self.engine = engine
         self.dModel = dModel
-        self.mha = MultiHeadAttention(engine: engine, dModel: dModel, numHeads: numHeads, seqLen: (224/14)*(224/14))
-        self.ffn1 = LinearLayer(engine: engine, rows: dModel * 4, cols: dModel)
-        self.ffn2 = LinearLayer(engine: engine, rows: dModel, cols: dModel * 4)
+        let numPatches = (224/14)*(224/14)
+        self.mha = MultiHeadAttention(engine: engine, seqLen: numPatches, dModel: dModel, numHeads: numHeads, useCausalMask: false)
+        self.ffn1 = LinearLayer(engine: engine, inputDim: dModel, outputDim: dModel * 4, batchSize: numPatches, useReLU: true)
+        self.ffn2 = LinearLayer(engine: engine, inputDim: dModel * 4, outputDim: dModel, batchSize: numPatches, useReLU: false)
         
         self.ln1Gamma = Tensor(device: engine.device, rows: 1, cols: dModel)
         self.ln2Gamma = Tensor(device: engine.device, rows: 1, cols: dModel)
@@ -135,7 +141,8 @@ public class ViTBlock {
         memcpy(ln1.buffer.contents(), input.buffer.contents(), input.rows * input.cols * 4)
         dispatchLayerNorm(data: ln1, gamma: ln1Gamma)
         
-        let attnOut = mha.forward(input: ln1)
+        mha.forward(input: ln1)
+        let attnOut = mha.output
         dispatchAdd(a: input, b: attnOut, out: ln1, length: input.rows * input.cols)
         
         // x = x + FFN(LN(x))
